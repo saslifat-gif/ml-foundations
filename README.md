@@ -1,5 +1,3 @@
-# my_ml_code
-
 # Toy Flow Matching from Scratch
 
 Implementing Flow Matching (Lipman et al. 2022) from scratch on a 2D toy dataset.
