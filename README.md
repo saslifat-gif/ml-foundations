@@ -8,7 +8,7 @@ Each notebook is self-contained: plain Python, minimal dependencies, built to un
 
 ## Notebooks
 
-### 📊 Probability & Statistics
+###  Probability & Statistics
 
 **`probability-statistics/01_bayes_theorem.ipynb`**
 
@@ -20,7 +20,7 @@ The librarian vs. farmer problem from Kahneman & Tversky. Builds Bayes' theorem 
 
 ---
 
-### 🌊 Flow Matching
+###  Flow Matching
 
 **`flow matching/`**
 
