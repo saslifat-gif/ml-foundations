@@ -1,4 +1,4 @@
 .DS_Store
 data/
 /.claude
-bert\stage1_best.pt
+*.pt
