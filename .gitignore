@@ -1,2 +1,7 @@
 .DS_Store
 data/
+<<<<<<< HEAD
+=======
+/.claude
+*.pt
+>>>>>>> ee994fa193a47482a09bb74b7e740a5201d842d4

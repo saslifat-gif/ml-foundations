@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import json; nb=json.load\\(open\\('paralla_decoder.ipynb'\\)\\); print\\(json.dumps\\([{'id': c['id'], 'src_preview': ''.join\\(c['source']\\)[:80]} for c in nb['cells']], indent=2\\)\\)\")",
+      "Bash(python -c \"import json; nb=json.load\\(open\\('paralla_decoder.ipynb', encoding='utf-8'\\)\\); print\\(json.dumps\\([{'id': c['id'], 'src_preview': ''.join\\(c['source']\\)[:80]} for c in nb['cells']], indent=2\\)\\)\")",
+      "Bash(chmod +x \"d:/study/ml-foundations/.git/hooks/pre-commit\")"
+    ]
+  }
+}
