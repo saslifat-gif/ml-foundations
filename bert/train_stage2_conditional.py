@@ -17,6 +17,8 @@ torch.backends.cudnn.benchmark = True
 RESUME = False   # ← set True to continue from checkpoint, False to train from scratch
 PROMPT_LEN = 16
 COND_DROP_PROB = 0.15
+MAX_SEQ_LEN = 128
+USE_OT = False
 OT_EPS = 0.05
 OT_ITERS = 30
 METRIC_REG = 1e-4
@@ -31,14 +33,14 @@ print(f"using: {device}")
 class FlowNet(nn.Module):
     def __init__(self, latent_dim=256, hidden_dim=2048, depth=8):
         super().__init__()
-        layers = [nn.Linear(latent_dim * 2 + 1, hidden_dim), nn.SiLU()]
+        layers = [nn.Linear(latent_dim * 2 + 2, hidden_dim), nn.SiLU()]
         for _ in range(depth - 2):
             layers += [nn.Linear(hidden_dim, hidden_dim), nn.SiLU()]
         layers.append(nn.Linear(hidden_dim, latent_dim))
         self.net = nn.Sequential(*layers)
 
-    def forward(self, z_t, t, z_cond):
-        inp = torch.cat([z_t, z_cond, t.unsqueeze(-1)], dim=-1)
+    def forward(self, z_t, t, z_cond, pos):
+        inp = torch.cat([z_t, z_cond, t.unsqueeze(-1), pos.unsqueeze(-1)], dim=-1)
         return self.net(inp)
 
 
@@ -47,15 +49,15 @@ class MetricNet(nn.Module):
         super().__init__()
         self.log_bound = log_bound
         self.net = nn.Sequential(
-            nn.Linear(latent_dim * 2 + 1, hidden_dim),
+            nn.Linear(latent_dim * 2 + 2, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, latent_dim),
         )
 
-    def forward(self, z_t, t, z_cond):
-        inp = torch.cat([z_t, z_cond, t.unsqueeze(-1)], dim=-1)
+    def forward(self, z_t, t, z_cond, pos):
+        inp = torch.cat([z_t, z_cond, t.unsqueeze(-1), pos.unsqueeze(-1)], dim=-1)
         log_g = self.net(inp)
         log_g = log_g - log_g.mean(dim=-1, keepdim=True)
         log_g = log_g.clamp(-self.log_bound, self.log_bound)
@@ -69,6 +71,12 @@ def prompt_condition(z_data, attention_mask, prompt_len=PROMPT_LEN):
     prompt_mask = attention_mask[:, :prompt_len].to(prompt_z.dtype).unsqueeze(-1)
     denom = prompt_mask.sum(dim=1).clamp_min(1.0)
     return (prompt_z * prompt_mask).sum(dim=1) / denom
+
+
+def suffix_positions(batch_size, suffix_len, device, dtype=torch.float32):
+    pos = torch.arange(PROMPT_LEN, PROMPT_LEN + suffix_len, device=device, dtype=dtype)
+    pos = pos / max(MAX_SEQ_LEN - 1, 1)
+    return pos.unsqueeze(0).expand(batch_size, suffix_len)
 
 
 def sinkhorn_ot_barycentric_targets(z_noise, z_target, target_mask=None, eps=OT_EPS, iters=OT_ITERS):
@@ -111,15 +119,26 @@ def flow_matching_loss(flow_net, metric_net, z_target, z_cond, target_mask=None,
 
     B, T, D = z_target.shape
     z_noise_seq = torch.randn_like(z_target)
-    z_target_ot = sinkhorn_ot_barycentric_targets(z_noise_seq, z_target, target_mask)
-    z_flat = z_target_ot.reshape(B * T, D)
+    if USE_OT:
+        z_target = sinkhorn_ot_barycentric_targets(z_noise_seq, z_target, target_mask)
+
+    z_flat = z_target.reshape(B * T, D)
     cond_flat = z_cond.unsqueeze(1).expand(-1, T, -1).reshape(B * T, D)
     z_noise = z_noise_seq.reshape(B * T, D)
-    t = torch.rand(B * T, device=z_target.device)
+    pos_flat = suffix_positions(B, T, z_target.device, z_target.dtype).reshape(B * T)
+    if target_mask is not None:
+        valid_flat = target_mask.reshape(B * T).bool()
+        z_flat = z_flat[valid_flat]
+        cond_flat = cond_flat[valid_flat]
+        z_noise = z_noise[valid_flat]
+        pos_flat = pos_flat[valid_flat]
+
+    N = z_flat.size(0)
+    t = torch.rand(N, device=z_target.device)
     z_t = (1 - t.unsqueeze(-1)) * z_noise + t.unsqueeze(-1) * z_flat
     v_true = z_flat - z_noise
-    v_pred = flow_net(z_t, t, cond_flat)
-    g_diag = metric_net(z_t, t, cond_flat)
+    v_pred = flow_net(z_t, t, cond_flat, pos_flat)
+    g_diag = metric_net(z_t, t, cond_flat, pos_flat)
     err = (v_pred - v_true).pow(2)
     euclidean_loss = err.mean()
     metric_loss = (g_diag * err).mean(dim=-1).mean()
@@ -135,14 +154,18 @@ def flow_matching_loss(flow_net, metric_net, z_target, z_cond, target_mask=None,
     return total_loss
 
 
-def generate_suffix(flow_net, z_cond, batch_size, suffix_len, latent_dim, device, steps=50):
+def generate_suffix(flow_net, z_cond, batch_size, suffix_len, latent_dim, device, steps=50, guidance_scale=1.0):
     z_cond_gen = z_cond.unsqueeze(1).expand(-1, suffix_len, -1).reshape(batch_size * suffix_len, latent_dim)
+    pos_gen = suffix_positions(batch_size, suffix_len, device).reshape(batch_size * suffix_len)
     z_gen = torch.randn(batch_size * suffix_len, latent_dim, device=device)
     dt = 1.0 / steps
     for i in range(steps):
         t_val = torch.full((batch_size * suffix_len,), i / steps, device=device)
         with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-            v = flow_net(z_gen, t_val, z_cond_gen)
+            v = flow_net(z_gen, t_val, z_cond_gen, pos_gen)
+            if guidance_scale != 1.0:
+                v_uncond = flow_net(z_gen, t_val, torch.zeros_like(z_cond_gen), pos_gen)
+                v = v_uncond + guidance_scale * (v - v_uncond)
         z_gen = z_gen + v * dt
     return z_gen.view(batch_size, suffix_len, latent_dim)
 
@@ -186,7 +209,8 @@ def evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, devi
         gen_std    = z_gen_flat.std().item()
         metric_cond = z_cond.unsqueeze(1).expand(-1, S - PROMPT_LEN, -1)[suffix_mask]
         metric_t = torch.full((z_gen_flat.size(0),), 0.5, device=device)
-        metric_diag = metric_net(z_gen_flat, metric_t, metric_cond)
+        metric_pos = suffix_positions(B, S - PROMPT_LEN, device)[suffix_mask]
+        metric_diag = metric_net(z_gen_flat, metric_t, metric_cond, metric_pos)
         metric_mean = metric_diag.mean().item()
         metric_std = metric_diag.std().item()
         cosine_sim = F.cosine_similarity(
@@ -340,5 +364,7 @@ for epoch in range(EPOCHS):
             "metric_reg": METRIC_REG,
             "metric_log_bound": METRIC_LOG_BOUND,
             "euclidean_loss_weight": EUCLIDEAN_LOSS_WEIGHT,
+            "use_ot": USE_OT,
+            "max_seq_len": MAX_SEQ_LEN,
         }, "stage2_conditional_best.pt")
         print(f"saved best model at val loss {best_loss:.4f}\n", flush=True)
