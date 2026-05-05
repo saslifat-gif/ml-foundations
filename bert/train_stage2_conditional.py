@@ -6,7 +6,7 @@ from torch.optim import AdamW
 from transformers import BertTokenizer
 
 sys.path.insert(0, ".")
-from paralla_decoder import BertEncoder, ParallelDecoder, build_dataloaders
+from parallel_decoder import BertEncoder, ParallelDecoder, build_dataloaders
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True

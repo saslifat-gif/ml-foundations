@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from transformers import BertTokenizer
 
 sys.path.insert(0, ".")
-from paralla_decoder import BertEncoder, ParallelDecoder
+from parallel_decoder import BertEncoder, ParallelDecoder
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PROMPT_LEN = 16
