@@ -23,11 +23,11 @@ USE_OT = False
 COMPILE_MODELS = False
 FAST_DEBUG = False
 TRAIN_SIZE = 1000000
-TRAIN_BATCH_SIZE = 256
+TRAIN_BATCH_SIZE = 2048
 FLOW_HIDDEN_DIM = 512
 FLOW_DEPTH = 4
 METRIC_HIDDEN_DIM = 256
-LOG_EVERY = 10
+LOG_EVERY = 50
 OT_EPS = 0.05
 OT_ITERS = 30
 METRIC_REG = 1e-4
@@ -35,10 +35,10 @@ METRIC_LOG_BOUND = 1.0
 EUCLIDEAN_LOSS_WEIGHT = 0.25
 DECODE_LOSS_WEIGHT = 0.02
 DECODE_LOSS_BATCH = 64
-SAMPLED_DECODE_LOSS_WEIGHT = 0.003
+SAMPLED_DECODE_LOSS_WEIGHT = 0.0
 SAMPLED_DECODE_BATCH = 8
 SAMPLED_DECODE_STEPS = 8
-SAMPLED_LATENT_LOSS_WEIGHT = 0.25
+SAMPLED_LATENT_LOSS_WEIGHT = 0.50
 # ─────────────────────────────────────────────────────────────────────────────
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -277,7 +277,11 @@ def flow_matching_loss(
         suffix_targets = suffix_ids[:n_decode].reshape(-1)
         decode_loss = F.cross_entropy(suffix_logits, suffix_targets, ignore_index=0)
 
-    if decoder is not None and z_prompt is not None and suffix_ids is not None and SAMPLED_DECODE_LOSS_WEIGHT > 0:
+    if (
+        z_prompt is not None
+        and suffix_ids is not None
+        and (SAMPLED_DECODE_LOSS_WEIGHT > 0 or SAMPLED_LATENT_LOSS_WEIGHT > 0)
+    ):
         n_sampled = min(SAMPLED_DECODE_BATCH, B)
         z_sampled = z_noise_seq[:n_sampled]
         z_cond_sampled = z_cond[:n_sampled]
@@ -294,20 +298,22 @@ def flow_matching_loss(
             z_sampled = z_sampled + v_sampled * dt
 
         z_sampled_seq = torch.cat([z_prompt[:n_sampled], z_sampled], dim=1)
-        sampled_logits = decoder.decode_from_latent(z_sampled_seq)
-        sampled_suffix_logits = sampled_logits[:, PROMPT_LEN:, :].reshape(-1, sampled_logits.size(-1))
-        sampled_suffix_targets = suffix_ids[:n_sampled].reshape(-1)
         sampled_err = (z_sampled - z_target[:n_sampled]).pow(2)
         if target_mask is not None:
             sampled_valid = target_mask[:n_sampled].to(sampled_err.dtype).unsqueeze(-1)
             sampled_latent_loss = (sampled_err * sampled_valid).sum() / sampled_valid.sum().clamp_min(1.0) / D
         else:
             sampled_latent_loss = sampled_err.mean()
-        sampled_decode_loss = F.cross_entropy(
-            sampled_suffix_logits,
-            sampled_suffix_targets,
-            ignore_index=0,
-        )
+
+        if decoder is not None and SAMPLED_DECODE_LOSS_WEIGHT > 0:
+            sampled_logits = decoder.decode_from_latent(z_sampled_seq)
+            sampled_suffix_logits = sampled_logits[:, PROMPT_LEN:, :].reshape(-1, sampled_logits.size(-1))
+            sampled_suffix_targets = suffix_ids[:n_sampled].reshape(-1)
+            sampled_decode_loss = F.cross_entropy(
+                sampled_suffix_logits,
+                sampled_suffix_targets,
+                ignore_index=0,
+            )
 
     total_loss = (
         metric_loss
@@ -414,15 +420,19 @@ def evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, devi
             print(f"  generated:  {generated[:120]}")
             print()
 
+    latent_std_gap = abs(gen_std - real_std)
+    val_score = avg_val_loss + latent_std_gap + max(0.0, 0.8 - cosine_sim)
+
     print(f"── val metrics ───────────────────────────────────────────────")
     print(f"  val flow loss : {avg_val_loss:.4f}")
     print(f"  real latents  : mean={real_mean:.3f}  std={real_std:.3f}")
     print(f"  gen  latents  : mean={gen_mean:.3f}  std={gen_std:.3f}")
     print(f"  metric diag   : mean={metric_mean:.3f}  std={metric_std:.3f}")
     print(f"  cosine sim    : {cosine_sim:.4f}  (1.0=perfect, 0.0=orthogonal)")
+    print(f"  val score     : {val_score:.4f}  (lower=better; includes gen std/cosine)")
     print()
 
-    return avg_val_loss
+    return avg_val_loss, val_score
 
 
 # ── load stage 1 ──────────────────────────────────────────────────────────────
@@ -457,7 +467,7 @@ optimizer = AdamW([
     {"params": metric_net.parameters(), "lr": 5e-5},
 ])
 scaler    = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
-best_loss = float("inf")
+best_score = float("inf")
 
 # ── resume or fresh start ─────────────────────────────────────────────────────
 if RESUME:
@@ -470,8 +480,10 @@ if RESUME:
     if "encoder" in ckpt2:
         encoder.load_state_dict(ckpt2["encoder"])
     if "best_loss" in ckpt2:
-        best_loss = ckpt2["best_loss"]
-    print(f"resumed from stage2_conditional_best.pt | best_loss={best_loss:.4f}")
+        best_score = ckpt2["best_loss"]
+    if "best_score" in ckpt2:
+        best_score = ckpt2["best_score"]
+    print(f"resumed from stage2_conditional_best.pt | best_score={best_score:.4f}")
 else:
     print("training from scratch")
 
@@ -539,15 +551,16 @@ for epoch in range(EPOCHS):
     avg_loss = train_loss / len(train_loader)
     print(f"\nepoch {epoch+1} done | avg train loss {avg_loss:.4f}", flush=True)
 
-    avg_val_loss = evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, device)
+    avg_val_loss, val_score = evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, device)
 
-    if avg_val_loss < best_loss:
-        best_loss = avg_val_loss
+    if val_score < best_score:
+        best_score = val_score
         torch.save({
             "flow_net": flow_net.state_dict(),
             "metric_net": metric_net.state_dict(),
             "encoder":  encoder.state_dict(),
-            "best_loss": best_loss,
+            "best_loss": avg_val_loss,
+            "best_score": best_score,
             "ot_eps": OT_EPS,
             "ot_iters": OT_ITERS,
             "metric_reg": METRIC_REG,
@@ -568,4 +581,4 @@ for epoch in range(EPOCHS):
             "train_size": TRAIN_SIZE,
             "prompt_condition": "sequence_mean_projected",
         }, "stage2_conditional_best.pt")
-        print(f"saved best model at val loss {best_loss:.4f}\n", flush=True)
+        print(f"saved best model at val score {best_score:.4f} | flow loss {avg_val_loss:.4f}\n", flush=True)
