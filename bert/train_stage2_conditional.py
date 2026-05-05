@@ -39,6 +39,7 @@ SAMPLED_DECODE_LOSS_WEIGHT = 0.0
 SAMPLED_DECODE_BATCH = 8
 SAMPLED_DECODE_STEPS = 8
 SAMPLED_LATENT_LOSS_WEIGHT = 0.50
+SAMPLED_STD_LOSS_WEIGHT = 0.25
 # ─────────────────────────────────────────────────────────────────────────────
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -219,6 +220,7 @@ def flow_matching_loss(
                     "decode_loss": 0.0,
                     "sampled_decode_loss": 0.0,
                     "sampled_latent_loss": 0.0,
+                    "sampled_std_loss": 0.0,
                     "metric_mean": 0.0,
                     "metric_std": 0.0,
                 }
@@ -268,6 +270,7 @@ def flow_matching_loss(
     decode_loss = z_target.new_tensor(0.0)
     sampled_decode_loss = z_target.new_tensor(0.0)
     sampled_latent_loss = z_target.new_tensor(0.0)
+    sampled_std_loss = z_target.new_tensor(0.0)
     if decoder is not None and z_prompt is not None and suffix_ids is not None and DECODE_LOSS_WEIGHT > 0:
         n_decode = min(DECODE_LOSS_BATCH, B)
         z_pred_suffix = z_t_seq[:n_decode] + (1.0 - t_seq[:n_decode].unsqueeze(-1)) * v_pred_seq[:n_decode]
@@ -302,8 +305,13 @@ def flow_matching_loss(
         if target_mask is not None:
             sampled_valid = target_mask[:n_sampled].to(sampled_err.dtype).unsqueeze(-1)
             sampled_latent_loss = (sampled_err * sampled_valid).sum() / sampled_valid.sum().clamp_min(1.0) / D
+            sampled_std = z_sampled[target_mask[:n_sampled].bool()].std()
+            target_std = z_target[:n_sampled][target_mask[:n_sampled].bool()].std()
         else:
             sampled_latent_loss = sampled_err.mean()
+            sampled_std = z_sampled.std()
+            target_std = z_target[:n_sampled].std()
+        sampled_std_loss = (sampled_std - target_std.detach()).pow(2)
 
         if decoder is not None and SAMPLED_DECODE_LOSS_WEIGHT > 0:
             sampled_logits = decoder.decode_from_latent(z_sampled_seq)
@@ -321,6 +329,7 @@ def flow_matching_loss(
         + DECODE_LOSS_WEIGHT * decode_loss
         + SAMPLED_DECODE_LOSS_WEIGHT * sampled_decode_loss
         + SAMPLED_LATENT_LOSS_WEIGHT * sampled_latent_loss
+        + SAMPLED_STD_LOSS_WEIGHT * sampled_std_loss
         + metric_reg
     )
     if return_stats:
@@ -330,6 +339,7 @@ def flow_matching_loss(
             "decode_loss": decode_loss.detach().item(),
             "sampled_decode_loss": sampled_decode_loss.detach().item(),
             "sampled_latent_loss": sampled_latent_loss.detach().item(),
+            "sampled_std_loss": sampled_std_loss.detach().item(),
             "metric_mean": g_diag.detach().mean().item(),
             "metric_std": g_diag.detach().std().item(),
         }
@@ -544,6 +554,7 @@ for epoch in range(EPOCHS):
                 f" | dloss {stats['decode_loss']:.4f}"
                 f" | sdloss {stats['sampled_decode_loss']:.4f}"
                 f" | slloss {stats['sampled_latent_loss']:.4f}"
+                f" | ssloss {stats['sampled_std_loss']:.4f}"
                 f" | metric {stats['metric_mean']:.3f}±{stats['metric_std']:.3f}",
                 flush=True,
             )
@@ -572,6 +583,7 @@ for epoch in range(EPOCHS):
             "sampled_decode_batch": SAMPLED_DECODE_BATCH,
             "sampled_decode_steps": SAMPLED_DECODE_STEPS,
             "sampled_latent_loss_weight": SAMPLED_LATENT_LOSS_WEIGHT,
+            "sampled_std_loss_weight": SAMPLED_STD_LOSS_WEIGHT,
             "use_ot": USE_OT,
             "max_seq_len": MAX_SEQ_LEN,
             "base_noise_std": BASE_NOISE_STD,
