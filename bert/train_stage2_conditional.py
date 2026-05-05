@@ -1,4 +1,5 @@
 import sys
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,6 +17,9 @@ torch.backends.cudnn.benchmark = True
 RESUME = False   # ← set True to continue from checkpoint, False to train from scratch
 PROMPT_LEN = 16
 COND_DROP_PROB = 0.15
+OT_EPS = 0.05
+OT_ITERS = 30
+METRIC_REG = 1e-4
 # ─────────────────────────────────────────────────────────────────────────────
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -36,6 +40,25 @@ class FlowNet(nn.Module):
         return self.net(inp)
 
 
+class MetricNet(nn.Module):
+    def __init__(self, latent_dim=256, hidden_dim=512, floor=0.05, ceiling=20.0):
+        super().__init__()
+        self.floor = floor
+        self.ceiling = ceiling
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim * 2 + 1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+
+    def forward(self, z_t, t, z_cond):
+        inp = torch.cat([z_t, z_cond, t.unsqueeze(-1)], dim=-1)
+        g_diag = F.softplus(self.net(inp)) + self.floor
+        return g_diag.clamp(max=self.ceiling)
+
+
 def prompt_condition(z_data, attention_mask, prompt_len=PROMPT_LEN):
     prompt_z = z_data[:, :prompt_len, :]
     prompt_mask = attention_mask[:, :prompt_len].to(prompt_z.dtype).unsqueeze(-1)
@@ -43,20 +66,56 @@ def prompt_condition(z_data, attention_mask, prompt_len=PROMPT_LEN):
     return (prompt_z * prompt_mask).sum(dim=1) / denom
 
 
-def flow_matching_loss(flow_net, z_target, z_cond, target_mask=None):
+def sinkhorn_ot_barycentric_targets(z_noise, z_target, target_mask=None, eps=OT_EPS, iters=OT_ITERS):
+    B, T, _ = z_target.shape
+    dtype = z_target.dtype
+    device = z_target.device
+
+    cost = torch.cdist(z_noise.float(), z_target.float(), p=2).pow(2)
+    if target_mask is None:
+        target_mask = torch.ones(B, T, device=device, dtype=dtype)
+    valid = target_mask.to(dtype)
+    cost = cost.masked_fill(valid[:, None, :] == 0, 1e4)
+
+    log_k = -cost / eps
+    log_a = torch.full((B, T), -math.log(T), device=device)
+    b = valid / valid.sum(dim=1, keepdim=True).clamp_min(1.0)
+    log_b = torch.log(b.clamp_min(1e-8))
+
+    u = torch.zeros_like(log_a)
+    v = torch.zeros_like(log_b)
+    for _ in range(iters):
+        u = log_a - torch.logsumexp(log_k + v[:, None, :], dim=2)
+        v = log_b - torch.logsumexp(log_k + u[:, :, None], dim=1)
+
+    plan = torch.exp(log_k + u[:, :, None] + v[:, None, :]).to(dtype)
+    return torch.bmm(plan * T, z_target)
+
+
+def flow_matching_loss(flow_net, metric_net, z_target, z_cond, target_mask=None):
+    if target_mask is not None:
+        has_target = target_mask.sum(dim=1) > 0
+        if not has_target.any():
+            zero = next(flow_net.parameters()).sum() + next(metric_net.parameters()).sum()
+            return zero * 0.0
+        z_target = z_target[has_target]
+        z_cond = z_cond[has_target]
+        target_mask = target_mask[has_target]
+
     B, T, D = z_target.shape
-    z_flat = z_target.reshape(B * T, D)
+    z_noise_seq = torch.randn_like(z_target)
+    z_target_ot = sinkhorn_ot_barycentric_targets(z_noise_seq, z_target, target_mask)
+    z_flat = z_target_ot.reshape(B * T, D)
     cond_flat = z_cond.unsqueeze(1).expand(-1, T, -1).reshape(B * T, D)
-    z_noise = torch.randn_like(z_flat)
+    z_noise = z_noise_seq.reshape(B * T, D)
     t = torch.rand(B * T, device=z_target.device)
     z_t = (1 - t.unsqueeze(-1)) * z_noise + t.unsqueeze(-1) * z_flat
     v_true = z_flat - z_noise
     v_pred = flow_net(z_t, t, cond_flat)
-    loss = F.mse_loss(v_pred, v_true, reduction="none").mean(dim=-1)
-    if target_mask is None:
-        return loss.mean()
-    mask = target_mask.reshape(B * T).to(loss.dtype)
-    return (loss * mask).sum() / mask.sum().clamp_min(1.0)
+    g_diag = metric_net(z_t, t, cond_flat)
+    loss = (g_diag * (v_pred - v_true).pow(2)).mean(dim=-1)
+    metric_reg = METRIC_REG * (g_diag.log().pow(2).mean() + g_diag.mean())
+    return loss.mean() + metric_reg
 
 
 def generate_suffix(flow_net, z_cond, batch_size, suffix_len, latent_dim, device, steps=50):
@@ -71,8 +130,9 @@ def generate_suffix(flow_net, z_cond, batch_size, suffix_len, latent_dim, device
     return z_gen.view(batch_size, suffix_len, latent_dim)
 
 
-def evaluate(flow_net, encoder, decoder, tokenizer, val_loader, device, n_samples=4):
+def evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, device, n_samples=4):
     flow_net.eval()
+    metric_net.eval()
     encoder.eval()
     decoder.eval()
 
@@ -86,7 +146,7 @@ def evaluate(flow_net, encoder, decoder, tokenizer, val_loader, device, n_sample
                 z_cond   = prompt_condition(z_data, attention_mask)
                 z_target = z_data[:, PROMPT_LEN:, :]
                 target_mask = attention_mask[:, PROMPT_LEN:]
-                val_loss += flow_matching_loss(flow_net, z_target, z_cond, target_mask).item()
+                val_loss += flow_matching_loss(flow_net, metric_net, z_target, z_cond, target_mask).item()
     avg_val_loss = val_loss / len(val_loader)
 
     with torch.no_grad():
@@ -106,6 +166,11 @@ def evaluate(flow_net, encoder, decoder, tokenizer, val_loader, device, n_sample
         real_std   = z_real_flat.std().item()
         gen_mean   = z_gen_flat.mean().item()
         gen_std    = z_gen_flat.std().item()
+        metric_cond = z_cond.unsqueeze(1).expand(-1, S - PROMPT_LEN, -1).reshape(B * (S - PROMPT_LEN), D)
+        metric_t = torch.full((B * (S - PROMPT_LEN),), 0.5, device=device)
+        metric_diag = metric_net(z_gen_flat, metric_t, metric_cond)
+        metric_mean = metric_diag.mean().item()
+        metric_std = metric_diag.std().item()
         cosine_sim = F.cosine_similarity(
             z_real_flat.mean(0, keepdim=True),
             z_gen_flat.mean(0, keepdim=True)
@@ -128,6 +193,7 @@ def evaluate(flow_net, encoder, decoder, tokenizer, val_loader, device, n_sample
     print(f"  val flow loss : {avg_val_loss:.4f}")
     print(f"  real latents  : mean={real_mean:.3f}  std={real_std:.3f}")
     print(f"  gen  latents  : mean={gen_mean:.3f}  std={gen_std:.3f}")
+    print(f"  metric diag   : mean={metric_mean:.3f}  std={metric_std:.3f}")
     print(f"  cosine sim    : {cosine_sim:.4f}  (1.0=perfect, 0.0=orthogonal)")
     print()
 
@@ -159,9 +225,11 @@ train_loader, val_loader = build_dataloaders(
 
 # ── models + optimizer ────────────────────────────────────────────────────────
 flow_net = FlowNet(latent_dim=256, hidden_dim=2048, depth=8).to(device)
+metric_net = MetricNet(latent_dim=256, hidden_dim=512).to(device)
 
 optimizer = AdamW([
     {"params": flow_net.parameters(), "lr": 1e-4},
+    {"params": metric_net.parameters(), "lr": 5e-5},
 ])
 scaler    = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 best_loss = float("inf")
@@ -171,6 +239,9 @@ if RESUME:
     ckpt2 = torch.load("stage2_conditional_best.pt", map_location=device, weights_only=False)
     state = {k.replace("_orig_mod.", ""): v for k, v in ckpt2["flow_net"].items()}
     flow_net.load_state_dict(state)
+    if "metric_net" in ckpt2:
+        metric_state = {k.replace("_orig_mod.", ""): v for k, v in ckpt2["metric_net"].items()}
+        metric_net.load_state_dict(metric_state)
     if "encoder" in ckpt2:
         encoder.load_state_dict(ckpt2["encoder"])
     if "best_loss" in ckpt2:
@@ -180,12 +251,14 @@ else:
     print("training from scratch")
 
 flow_net = torch.compile(flow_net)
+metric_net = torch.compile(metric_net)
 
 EPOCHS = 20
 
 # ── training loop ─────────────────────────────────────────────────────────────
 for epoch in range(EPOCHS):
     flow_net.train()
+    metric_net.train()
     encoder.eval()
     train_loss = 0
 
@@ -202,12 +275,15 @@ for epoch in range(EPOCHS):
             z_cond = z_cond.masked_fill(drop_mask.unsqueeze(-1), 0.0)
             z_target = z_data[:, PROMPT_LEN:, :]
             target_mask = attention_mask[:, PROMPT_LEN:]
-            loss = flow_matching_loss(flow_net, z_target, z_cond, target_mask)
+            loss = flow_matching_loss(flow_net, metric_net, z_target, z_cond, target_mask)
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(flow_net.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(
+            list(flow_net.parameters()) + list(metric_net.parameters()),
+            max_norm=1.0
+        )
         scaler.step(optimizer)
         scaler.update()
 
@@ -219,13 +295,17 @@ for epoch in range(EPOCHS):
     avg_loss = train_loss / len(train_loader)
     print(f"\nepoch {epoch+1} done | avg train loss {avg_loss:.4f}", flush=True)
 
-    avg_val_loss = evaluate(flow_net, encoder, decoder, tokenizer, val_loader, device)
+    avg_val_loss = evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, device)
 
     if avg_val_loss < best_loss:
         best_loss = avg_val_loss
         torch.save({
             "flow_net": flow_net.state_dict(),
+            "metric_net": metric_net.state_dict(),
             "encoder":  encoder.state_dict(),
             "best_loss": best_loss,
+            "ot_eps": OT_EPS,
+            "ot_iters": OT_ITERS,
+            "metric_reg": METRIC_REG,
         }, "stage2_conditional_best.pt")
         print(f"saved best model at val loss {best_loss:.4f}\n", flush=True)
