@@ -79,7 +79,7 @@ def build_dataloaders(tokenizer, train_size=1000000, batch_size=128):
 
 def train(encoder, decoder, train_loader, val_loader, device, epochs=10, lr=1e-4):
     optimizer     = AdamW(decoder.parameters(), lr=lr)
-    scaler        = torch.amp.GradScaler("cuda")
+    scaler        = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     VOCAB_SIZE    = 30522
     best_val_loss = float("inf")
 
@@ -92,13 +92,13 @@ def train(encoder, decoder, train_loader, val_loader, device, epochs=10, lr=1e-4
         decoder.train()
         train_loss = 0
 
-# instead of annealing over epochs, anneal within the single epoch by step
+        # Instead of annealing over epochs, anneal within the single epoch by step.
         for step, batch in enumerate(train_loader):
             residual_weight = max(0.0, 1.0 - step / len(train_loader))  # 1.0 → 0.0 over steps
             input_ids      = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
 
-            with torch.amp.autocast("cuda"):
+            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 z      = encoder(input_ids, attention_mask)
                 logits = decoder(z, residual_weight=residual_weight)
                 loss   = F.cross_entropy(
@@ -127,16 +127,15 @@ def train(encoder, decoder, train_loader, val_loader, device, epochs=10, lr=1e-4
         with torch.no_grad():
             for batch in val_loader:
                 input_ids      = batch["input_ids"].to(device, non_blocking=True)
-                input_ids      = batch["input_ids"].to(device, non_blocking=True)
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-        with torch.amp.autocast("cuda"):
-            z      = encoder(input_ids, attention_mask)
-            logits = decoder(z, residual_weight=residual_weight)
-            val_loss += F.cross_entropy(
-                logits.view(-1, VOCAB_SIZE),
-                input_ids.view(-1),
-                ignore_index=0,
-            ).item()
+                attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+                with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                    z      = encoder(input_ids, attention_mask)
+                    logits = decoder(z, residual_weight=0.0)
+                    val_loss += F.cross_entropy(
+                        logits.view(-1, VOCAB_SIZE),
+                        input_ids.view(-1),
+                        ignore_index=0,
+                    ).item()
 
         avg_val = val_loss / len(val_loader)
         print(f"\nepoch {epoch+1} done | train {avg_train:.4f} | val {avg_val:.4f}\n", flush=True)

@@ -14,6 +14,8 @@ torch.backends.cudnn.benchmark = True
 
 # ── config ────────────────────────────────────────────────────────────────────
 RESUME = False   # ← set True to continue from checkpoint, False to train from scratch
+PROMPT_LEN = 16
+COND_DROP_PROB = 0.15
 # ─────────────────────────────────────────────────────────────────────────────
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -34,6 +36,41 @@ class FlowNet(nn.Module):
         return self.net(inp)
 
 
+def prompt_condition(z_data, attention_mask, prompt_len=PROMPT_LEN):
+    prompt_z = z_data[:, :prompt_len, :]
+    prompt_mask = attention_mask[:, :prompt_len].to(prompt_z.dtype).unsqueeze(-1)
+    denom = prompt_mask.sum(dim=1).clamp_min(1.0)
+    return (prompt_z * prompt_mask).sum(dim=1) / denom
+
+
+def flow_matching_loss(flow_net, z_target, z_cond, target_mask=None):
+    B, T, D = z_target.shape
+    z_flat = z_target.reshape(B * T, D)
+    cond_flat = z_cond.unsqueeze(1).expand(-1, T, -1).reshape(B * T, D)
+    z_noise = torch.randn_like(z_flat)
+    t = torch.rand(B * T, device=z_target.device)
+    z_t = (1 - t.unsqueeze(-1)) * z_noise + t.unsqueeze(-1) * z_flat
+    v_true = z_flat - z_noise
+    v_pred = flow_net(z_t, t, cond_flat)
+    loss = F.mse_loss(v_pred, v_true, reduction="none").mean(dim=-1)
+    if target_mask is None:
+        return loss.mean()
+    mask = target_mask.reshape(B * T).to(loss.dtype)
+    return (loss * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def generate_suffix(flow_net, z_cond, batch_size, suffix_len, latent_dim, device, steps=50):
+    z_cond_gen = z_cond.unsqueeze(1).expand(-1, suffix_len, -1).reshape(batch_size * suffix_len, latent_dim)
+    z_gen = torch.randn(batch_size * suffix_len, latent_dim, device=device)
+    dt = 1.0 / steps
+    for i in range(steps):
+        t_val = torch.full((batch_size * suffix_len,), i / steps, device=device)
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+            v = flow_net(z_gen, t_val, z_cond_gen)
+        z_gen = z_gen + v * dt
+    return z_gen.view(batch_size, suffix_len, latent_dim)
+
+
 def evaluate(flow_net, encoder, decoder, tokenizer, val_loader, device, n_samples=4):
     flow_net.eval()
     encoder.eval()
@@ -44,18 +81,12 @@ def evaluate(flow_net, encoder, decoder, tokenizer, val_loader, device, n_sample
         for batch in val_loader:
             input_ids      = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            with torch.amp.autocast("cuda"):
+            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 z_data   = decoder.compress(encoder(input_ids, attention_mask))
-                B, S, D  = z_data.shape
-                z_flat   = z_data.view(B * S, D)
-                z_prompt = z_data[:, :16, :].mean(dim=1)
-                z_cond   = z_prompt.unsqueeze(1).expand(-1, S, -1).reshape(B * S, D)
-                z_noise  = torch.randn_like(z_flat)
-                t        = torch.rand(B * S, device=device)
-                z_t      = (1 - t.unsqueeze(-1)) * z_noise + t.unsqueeze(-1) * z_flat
-                v_true   = z_flat - z_noise
-                v_pred   = flow_net(z_t, t, z_cond)
-                val_loss += F.mse_loss(v_pred, v_true).item()
+                z_cond   = prompt_condition(z_data, attention_mask)
+                z_target = z_data[:, PROMPT_LEN:, :]
+                target_mask = attention_mask[:, PROMPT_LEN:]
+                val_loss += flow_matching_loss(flow_net, z_target, z_cond, target_mask).item()
     avg_val_loss = val_loss / len(val_loader)
 
     with torch.no_grad():
@@ -64,35 +95,30 @@ def evaluate(flow_net, encoder, decoder, tokenizer, val_loader, device, n_sample
         attn_mask   = batch["attention_mask"].to(device)
         z_real      = decoder.compress(encoder(input_ids, attn_mask))
         B, S, D     = z_real.shape
-        z_real_flat = z_real.view(B * S, D)
+        z_real_suffix = z_real[:, PROMPT_LEN:, :]
+        z_real_flat = z_real_suffix.reshape(B * (S - PROMPT_LEN), D)
 
-        z_prompt   = z_real[:, :16, :].mean(dim=1)
-        z_cond_gen = z_prompt.unsqueeze(1).expand(-1, S, -1).reshape(B * S, D)
-
-        z_gen = torch.randn(B * S, D, device=device)
-        for i in range(20):
-            t_val = torch.full((B * S,), i / 20, device=device)
-            with torch.amp.autocast("cuda"):
-                v = flow_net(z_gen, t_val, z_cond_gen)
-            z_gen = z_gen + v / 20
+        z_cond = prompt_condition(z_real, attn_mask)
+        z_gen_suffix = generate_suffix(flow_net, z_cond, B, S - PROMPT_LEN, D, device, steps=50)
+        z_gen_flat = z_gen_suffix.reshape(B * (S - PROMPT_LEN), D)
 
         real_mean  = z_real_flat.mean().item()
         real_std   = z_real_flat.std().item()
-        gen_mean   = z_gen.mean().item()
-        gen_std    = z_gen.std().item()
+        gen_mean   = z_gen_flat.mean().item()
+        gen_std    = z_gen_flat.std().item()
         cosine_sim = F.cosine_similarity(
             z_real_flat.mean(0, keepdim=True),
-            z_gen.mean(0, keepdim=True)
+            z_gen_flat.mean(0, keepdim=True)
         ).item()
 
     with torch.no_grad():
-        z_gen_seq = z_gen.view(B, S, D)[:n_samples]
-        with torch.amp.autocast("cuda"):
+        z_gen_seq = torch.cat([z_real[:, :PROMPT_LEN, :], z_gen_suffix], dim=1)[:n_samples]
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
             logits = decoder.decode_from_latent(z_gen_seq)
         pred_ids = logits.argmax(-1)
         print("\n── conditional samples ───────────────────────────────────────")
         for i in range(n_samples):
-            prompt    = tokenizer.decode(input_ids[i, :16], skip_special_tokens=True)
+            prompt    = tokenizer.decode(input_ids[i, :PROMPT_LEN], skip_special_tokens=True)
             generated = tokenizer.decode(pred_ids[i], skip_special_tokens=True)
             print(f"  prompt:    {prompt}")
             print(f"  generated: {generated[:120]}")
@@ -120,8 +146,8 @@ if "encoder" in checkpoint:
 for param in decoder.parameters():
     param.requires_grad = False
 decoder.eval()
-encoder.train()
-print("stage1 loaded | decoder frozen | encoder unfrozen")
+encoder.eval()
+print("stage1 loaded | encoder+decoder frozen")
 
 # ── data ──────────────────────────────────────────────────────────────────────
 tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
@@ -136,9 +162,8 @@ flow_net = FlowNet(latent_dim=256, hidden_dim=2048, depth=8).to(device)
 
 optimizer = AdamW([
     {"params": flow_net.parameters(), "lr": 1e-4},
-    {"params": encoder.parameters(), "lr": 1e-5},
 ])
-scaler    = torch.amp.GradScaler("cuda")
+scaler    = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 best_loss = float("inf")
 
 # ── resume or fresh start ─────────────────────────────────────────────────────
@@ -161,41 +186,28 @@ EPOCHS = 20
 # ── training loop ─────────────────────────────────────────────────────────────
 for epoch in range(EPOCHS):
     flow_net.train()
-    encoder.train()
+    encoder.eval()
     train_loss = 0
 
     for step, batch in enumerate(train_loader):
         input_ids      = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
 
-        with torch.amp.autocast("cuda"):
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
             with torch.no_grad():
                 z_data = decoder.compress(encoder(input_ids, attention_mask))
 
-            B, S, D  = z_data.shape
-            z_flat   = z_data.view(B * S, D)
-            z_prompt = z_data[:, :16, :].mean(dim=1)          # [B, 256]
-
-            # dropout AFTER creating z_prompt
-            drop_mask = torch.rand(B, device=device) < 0.15
-            z_prompt[drop_mask] = 0.0                          # zero out dropped prompts
-
-            z_cond = z_prompt.unsqueeze(1).expand(-1, S, -1).reshape(B * S, D)  # [B*128, 256]
-
-            z_noise  = torch.randn_like(z_flat)
-            t        = torch.rand(B * S, device=device)
-            z_t      = (1 - t.unsqueeze(-1)) * z_noise + t.unsqueeze(-1) * z_flat
-            v_true   = z_flat - z_noise
-            v_pred   = flow_net(z_t, t, z_cond)
-            loss     = F.mse_loss(v_pred, v_true)
+            z_cond = prompt_condition(z_data, attention_mask)
+            drop_mask = torch.rand(z_data.size(0), device=device) < COND_DROP_PROB
+            z_cond = z_cond.masked_fill(drop_mask.unsqueeze(-1), 0.0)
+            z_target = z_data[:, PROMPT_LEN:, :]
+            target_mask = attention_mask[:, PROMPT_LEN:]
+            loss = flow_matching_loss(flow_net, z_target, z_cond, target_mask)
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(
-            list(flow_net.parameters()) + list(encoder.parameters()),
-            max_norm=1.0
-        )
+        torch.nn.utils.clip_grad_norm_(flow_net.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
 

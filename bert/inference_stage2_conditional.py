@@ -8,6 +8,7 @@ sys.path.insert(0, ".")
 from paralla_decoder import BertEncoder, ParallelDecoder
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+PROMPT_LEN = 16
 
 
 class FlowNet(nn.Module):
@@ -22,6 +23,12 @@ class FlowNet(nn.Module):
     def forward(self, z_t, t, z_cond):
         inp = torch.cat([z_t, z_cond, t.unsqueeze(-1)], dim=-1)
         return self.net(inp)
+
+
+def prompt_condition(z_prompt, attention_mask):
+    prompt_mask = attention_mask[:, :PROMPT_LEN].to(z_prompt.dtype).unsqueeze(-1)
+    denom = prompt_mask.sum(dim=1).clamp_min(1.0)
+    return (z_prompt[:, :PROMPT_LEN, :] * prompt_mask).sum(dim=1) / denom
 
 
 def load_models(stage1_path="stage1_best.pt", stage2_path="stage2_conditional_best.pt"):
@@ -51,24 +58,28 @@ def load_models(stage1_path="stage1_best.pt", stage2_path="stage2_conditional_be
 def generate(prompt_text, flow_net, encoder, decoder, tokenizer,
              n_samples=4, seq_len=128, latent_dim=256, steps=100, device=device):
     inputs = tokenizer(prompt_text, return_tensors="pt",
-                       max_length=16, padding="max_length", truncation=True)
+                       max_length=PROMPT_LEN, padding="max_length", truncation=True)
     input_ids      = inputs["input_ids"].to(device)
     attention_mask = inputs["attention_mask"].to(device)
 
     hidden   = encoder(input_ids, attention_mask)
-    z_prompt = decoder.compress(hidden).mean(dim=1)
-    z_cond   = z_prompt.expand(n_samples * seq_len, -1)
+    z_prompt = decoder.compress(hidden)
+    z_cond   = prompt_condition(z_prompt, attention_mask)
+    suffix_len = seq_len - PROMPT_LEN
+    z_cond = z_cond.expand(n_samples * suffix_len, -1)
 
-    z  = torch.randn(n_samples * seq_len, latent_dim, device=device)
+    z  = torch.randn(n_samples * suffix_len, latent_dim, device=device)
     dt = 1.0 / steps
     for i in range(steps):
-        t = torch.full((n_samples * seq_len,), i / steps, device=device)
-        with torch.amp.autocast("cuda"):
+        t = torch.full((n_samples * suffix_len,), i / steps, device=device)
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
             v = flow_net(z, t, z_cond)
         z = z + v * dt
 
-    z_seq    = z.view(n_samples, seq_len, latent_dim)
-    with torch.amp.autocast("cuda"):
+    z_prompt = z_prompt.expand(n_samples, PROMPT_LEN, latent_dim)
+    z_suffix = z.view(n_samples, suffix_len, latent_dim)
+    z_seq    = torch.cat([z_prompt, z_suffix], dim=1)
+    with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
         logits = decoder.decode_from_latent(z_seq)
     pred_ids = logits.argmax(-1)
     return [tokenizer.decode(pred_ids[i], skip_special_tokens=True)
@@ -90,25 +101,26 @@ def diagnose(flow_net, encoder, decoder, tokenizer, device):
     print("\n── same noise, different prompts ─────────────────────────────")
     for prompt in prompts:
         inputs = tokenizer(prompt, return_tensors="pt",
-                        max_length=16, padding="max_length", truncation=True)
+                        max_length=PROMPT_LEN, padding="max_length", truncation=True)
         input_ids      = inputs["input_ids"].to(device)
         attention_mask = inputs["attention_mask"].to(device)
 
         hidden   = encoder(input_ids, attention_mask)
-        z_prompt = decoder.compress(hidden).mean(dim=1)
-        z_cond   = z_prompt.expand(128, -1)
+        z_prompt = decoder.compress(hidden)
+        z_cond   = prompt_condition(z_prompt, attention_mask).expand(128 - PROMPT_LEN, -1)
 
-        z  = noise.clone()
+        z  = noise[:128 - PROMPT_LEN].clone()
         dt = 1.0 / 100
         for i in range(100):
-            t = torch.full((128,), i / 100, device=device)
+            t = torch.full((128 - PROMPT_LEN,), i / 100, device=device)
             with torch.no_grad():
                 v_cond   = flow_net(z, t, z_cond)
                 v_uncond = flow_net(z, t, torch.zeros_like(z_cond))
-                v        = v_uncond + 0.01 * (v_cond - v_uncond)
+                v        = v_uncond + 2.0 * (v_cond - v_uncond)
             z = z + v * dt
 
-        logits   = decoder.decode_from_latent(z.unsqueeze(0))
+        z_seq = torch.cat([z_prompt, z.unsqueeze(0)], dim=1)
+        logits   = decoder.decode_from_latent(z_seq)
         pred_ids = logits.argmax(-1)
         print(f"  prompt:    {prompt}")
         print(f"  generated: {tokenizer.decode(pred_ids[0], skip_special_tokens=True)[:100]}")
