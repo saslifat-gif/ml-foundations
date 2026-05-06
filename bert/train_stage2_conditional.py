@@ -19,13 +19,17 @@ PROMPT_LEN = 16
 COND_DROP_PROB = 0.15
 MAX_SEQ_LEN = 128
 BASE_NOISE_STD = 0.30
+CALIBRATE_GENERATED_LATENTS = True
+TARGET_LATENT_MEAN = -0.003
+TARGET_LATENT_STD = 0.264
+GENERATION_GUIDANCE_SCALE = 1.5
 USE_OT = False
 COMPILE_MODELS = False
 FAST_DEBUG = False
 TRAIN_SIZE = 1000000
-TRAIN_BATCH_SIZE = 2048
-FLOW_HIDDEN_DIM = 1024
-FLOW_DEPTH = 6
+TRAIN_BATCH_SIZE = 1024
+FLOW_HIDDEN_DIM = 512
+FLOW_DEPTH = 5
 METRIC_HIDDEN_DIM = 256
 LOG_EVERY = 50
 OT_EPS = 0.05
@@ -34,15 +38,19 @@ METRIC_REG = 1e-4
 METRIC_LOG_BOUND = 1.0
 METRIC_LOSS_WEIGHT = 0.0
 EUCLIDEAN_LOSS_WEIGHT = 1.0
-X0_LOSS_WEIGHT = 0.5
-DECODE_LOSS_WEIGHT = 0.02
+X0_LOSS_WEIGHT = 1.0
+DECODE_LOSS_WEIGHT = 0.03
 DECODE_LOSS_BATCH = 64
 SAMPLED_DECODE_LOSS_WEIGHT = 0.0
-SAMPLED_DECODE_BATCH = 8
-SAMPLED_DECODE_STEPS = 16
-SAMPLED_LATENT_LOSS_WEIGHT = 2.0
-SAMPLED_STD_LOSS_WEIGHT = 3.0
-SAMPLED_MOMENT_LOSS_WEIGHT = 2.0
+SAMPLED_DECODE_BATCH = 4
+SAMPLED_DECODE_STEPS = 8
+SAMPLED_LATENT_LOSS_WEIGHT = 1.0
+SAMPLED_STD_LOSS_WEIGHT = 1.0
+SAMPLED_MOMENT_LOSS_WEIGHT = 0.5
+SELF_GATE_SCALE = 0.10
+CROSS_GATE_SCALE = 0.05
+GATE_INIT = 0.10
+GATE_REG_WEIGHT = 0.0
 # ─────────────────────────────────────────────────────────────────────────────
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -60,6 +68,7 @@ print(
     "stage2 config | "
     f"train_size={TRAIN_SIZE} batch={TRAIN_BATCH_SIZE} "
     f"flow={FLOW_HIDDEN_DIM}x{FLOW_DEPTH} metric_hidden={METRIC_HIDDEN_DIM} "
+    f"guidance={GENERATION_GUIDANCE_SCALE} "
     f"compile={COMPILE_MODELS} fast_debug={FAST_DEBUG}",
     flush=True,
 )
@@ -107,8 +116,8 @@ class FlowNet(nn.Module):
             })
             for _ in range(depth)
         ])
-        self.self_gates = nn.ParameterList([nn.Parameter(torch.zeros(())) for _ in range(depth)])
-        self.cross_gates = nn.ParameterList([nn.Parameter(torch.zeros(())) for _ in range(depth)])
+        self.self_gates = nn.ParameterList([nn.Parameter(torch.tensor(GATE_INIT)) for _ in range(depth)])
+        self.cross_gates = nn.ParameterList([nn.Parameter(torch.tensor(GATE_INIT)) for _ in range(depth)])
         self.out_norm = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, latent_dim)
 
@@ -163,7 +172,7 @@ class FlowNet(nn.Module):
                 key_padding_mask=self_key_padding_mask,
                 need_weights=False,
             )
-            h = h + self.self_gates[block_idx].tanh() * self_out
+            h = h + SELF_GATE_SCALE * self.self_gates[block_idx].tanh() * self_out
             if prompt_h is not None:
                 cross_in = block["cross_norm"](h)
                 cross_out, _ = block["cross_attn"](
@@ -173,7 +182,7 @@ class FlowNet(nn.Module):
                     key_padding_mask=prompt_key_padding_mask,
                     need_weights=False,
                 )
-                h = h + self.cross_gates[block_idx].tanh() * cross_out
+                h = h + CROSS_GATE_SCALE * self.cross_gates[block_idx].tanh() * cross_out
             if mask is not None:
                 h = h * mask.to(h.dtype).unsqueeze(-1)
 
@@ -224,9 +233,16 @@ def suffix_positions(batch_size, suffix_len, device, dtype=torch.float32):
 def attention_gate_stats(flow_net):
     model = getattr(flow_net, "_orig_mod", flow_net)
     return (
-        torch.stack([gate.detach().tanh().abs() for gate in model.self_gates]).mean().item(),
-        torch.stack([gate.detach().tanh().abs() for gate in model.cross_gates]).mean().item(),
+        SELF_GATE_SCALE * torch.stack([gate.detach().tanh().abs() for gate in model.self_gates]).mean().item(),
+        CROSS_GATE_SCALE * torch.stack([gate.detach().tanh().abs() for gate in model.cross_gates]).mean().item(),
     )
+
+
+def attention_gate_regularizer(flow_net):
+    model = getattr(flow_net, "_orig_mod", flow_net)
+    self_reg = torch.stack([gate.tanh().pow(2) for gate in model.self_gates]).mean()
+    cross_reg = torch.stack([gate.tanh().pow(2) for gate in model.cross_gates]).mean()
+    return GATE_REG_WEIGHT * (self_reg + cross_reg)
 
 
 def masked_mean_std(x, mask=None, dim=(0, 1), eps=1e-6):
@@ -248,6 +264,23 @@ def flow_heun_step(flow_net, z, t, z_cond, pos, dt, mask=None):
     t_next = (t + dt).clamp(max=1.0)
     v_next = flow_net(z_euler, t_next, z_cond, pos, mask)
     return z + 0.5 * (v + v_next) * dt
+
+
+def calibrate_latents(z, mask=None, target_mean=TARGET_LATENT_MEAN, target_std=TARGET_LATENT_STD, eps=1e-6):
+    if not CALIBRATE_GENERATED_LATENTS:
+        return z
+    if mask is not None:
+        valid = mask.bool()
+        if valid.any():
+            mean = z[valid].mean()
+            std = z[valid].std().clamp_min(eps)
+        else:
+            mean = z.mean()
+            std = z.std().clamp_min(eps)
+    else:
+        mean = z.mean()
+        std = z.std().clamp_min(eps)
+    return (z - mean) * (target_std / std) + target_mean
 
 
 def sinkhorn_ot_barycentric_targets(z_noise, z_target, target_mask=None, eps=OT_EPS, iters=OT_ITERS):
@@ -305,6 +338,7 @@ def flow_matching_loss(
                     "metric_std": 0.0,
                     "self_gate": 0.0,
                     "cross_gate": 0.0,
+                    "gate_reg": 0.0,
                 }
             return zero * 0.0
         z_target = z_target[has_target]
@@ -358,6 +392,7 @@ def flow_matching_loss(
     sampled_latent_loss = z_target.new_tensor(0.0)
     sampled_std_loss = z_target.new_tensor(0.0)
     sampled_moment_loss = z_target.new_tensor(0.0)
+    gate_reg = attention_gate_regularizer(flow_net)
     if decoder is not None and z_prompt is not None and suffix_ids is not None and DECODE_LOSS_WEIGHT > 0:
         n_decode = min(DECODE_LOSS_BATCH, B)
         z_pred_suffix = z_t_seq[:n_decode] + (1.0 - t_seq[:n_decode].unsqueeze(-1)) * v_pred_seq[:n_decode]
@@ -439,6 +474,7 @@ def flow_matching_loss(
         + SAMPLED_LATENT_LOSS_WEIGHT * sampled_latent_loss
         + SAMPLED_STD_LOSS_WEIGHT * sampled_std_loss
         + SAMPLED_MOMENT_LOSS_WEIGHT * sampled_moment_loss
+        + gate_reg
         + metric_reg
     )
     if return_stats:
@@ -456,11 +492,22 @@ def flow_matching_loss(
             "metric_std": g_diag.detach().std().item(),
             "self_gate": self_gate,
             "cross_gate": cross_gate,
+            "gate_reg": gate_reg.detach().item(),
         }
     return total_loss
 
 
-def generate_suffix(flow_net, z_cond, batch_size, suffix_len, latent_dim, device, steps=50, guidance_scale=1.0):
+def generate_suffix(
+    flow_net,
+    z_cond,
+    batch_size,
+    suffix_len,
+    latent_dim,
+    device,
+    steps=50,
+    guidance_scale=GENERATION_GUIDANCE_SCALE,
+    mask=None,
+):
     pos_gen = suffix_positions(batch_size, suffix_len, device)
     z_gen = torch.randn(batch_size, suffix_len, latent_dim, device=device) * BASE_NOISE_STD
     dt = 1.0 / steps
@@ -478,6 +525,7 @@ def generate_suffix(flow_net, z_cond, batch_size, suffix_len, latent_dim, device
                 v_next_uncond = flow_net(z_euler, t_next, torch.zeros_like(z_cond), pos_gen)
                 v_next = v_next_uncond + guidance_scale * (v_next - v_next_uncond)
         z_gen = z_gen + 0.5 * (v + v_next) * dt
+    z_gen = calibrate_latents(z_gen, mask)
     return z_gen
 
 
@@ -511,7 +559,16 @@ def evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, devi
         z_real_flat = z_real_suffix[suffix_mask]
 
         z_cond = prompt_condition(z_real, attn_mask)
-        z_gen_suffix = generate_suffix(flow_net, z_cond, B, S - PROMPT_LEN, D, device, steps=50)
+        z_gen_suffix = generate_suffix(
+            flow_net,
+            z_cond,
+            B,
+            S - PROMPT_LEN,
+            D,
+            device,
+            steps=50,
+            mask=suffix_mask,
+        )
         z_gen_flat = z_gen_suffix[suffix_mask]
 
         real_mean  = z_real_flat.mean().item()
@@ -559,6 +616,7 @@ def evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, devi
     print(f"  gen  latents  : mean={gen_mean:.3f}  std={gen_std:.3f}")
     print(f"  metric diag   : mean={metric_mean:.3f}  std={metric_std:.3f}")
     print(f"  cosine sim    : {cosine_sim:.4f}  (1.0=perfect, 0.0=orthogonal)")
+    print(f"  guidance      : {GENERATION_GUIDANCE_SCALE:.2f}")
     print(f"  val score     : {val_score:.4f}  (lower=better; includes gen std/cosine)")
     print()
 
@@ -678,7 +736,8 @@ for epoch in range(EPOCHS):
                 f" | ssloss {stats['sampled_std_loss']:.4f}"
                 f" | smloss {stats['sampled_moment_loss']:.4f}"
                 f" | metric {stats['metric_mean']:.3f}±{stats['metric_std']:.3f}",
-                f" | gates s={stats['self_gate']:.3f} c={stats['cross_gate']:.3f}",
+                f" | gates s={stats['self_gate']:.4f} c={stats['cross_gate']:.4f}",
+                f" | greg {stats['gate_reg']:.5f}",
                 flush=True,
             )
 
@@ -710,13 +769,21 @@ for epoch in range(EPOCHS):
             "sampled_latent_loss_weight": SAMPLED_LATENT_LOSS_WEIGHT,
             "sampled_std_loss_weight": SAMPLED_STD_LOSS_WEIGHT,
             "sampled_moment_loss_weight": SAMPLED_MOMENT_LOSS_WEIGHT,
+            "self_gate_scale": SELF_GATE_SCALE,
+            "cross_gate_scale": CROSS_GATE_SCALE,
+            "gate_init": GATE_INIT,
+            "gate_reg_weight": GATE_REG_WEIGHT,
             "use_ot": USE_OT,
             "max_seq_len": MAX_SEQ_LEN,
             "base_noise_std": BASE_NOISE_STD,
+            "calibrate_generated_latents": CALIBRATE_GENERATED_LATENTS,
+            "target_latent_mean": TARGET_LATENT_MEAN,
+            "target_latent_std": TARGET_LATENT_STD,
+            "generation_guidance_scale": GENERATION_GUIDANCE_SCALE,
             "flow_hidden_dim": FLOW_HIDDEN_DIM,
             "flow_depth": FLOW_DEPTH,
             "metric_hidden_dim": METRIC_HIDDEN_DIM,
             "train_size": TRAIN_SIZE,
-            "prompt_condition": "gated_prompt_suffix_attention_v3",
+            "prompt_condition": "capped_prompt_suffix_attention_v4",
         }, "stage2_conditional_best.pt")
         print(f"saved best model at val score {best_score:.4f} | flow loss {avg_val_loss:.4f}\n", flush=True)

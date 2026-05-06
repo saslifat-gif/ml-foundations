@@ -11,8 +11,18 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PROMPT_LEN = 16
 MAX_SEQ_LEN = 128
 BASE_NOISE_STD = 0.30
+CALIBRATE_GENERATED_LATENTS = True
+TARGET_LATENT_MEAN = -0.003
+TARGET_LATENT_STD = 0.264
+DEFAULT_GUIDANCE_SCALE = 1.5
+DECODE_TEMPERATURE = 0.9
+DECODE_TOP_K = 50
+DECODE_TOP_P = 0.95
 FLOW_HIDDEN_DIM = 1024
 FLOW_DEPTH = 6
+SELF_GATE_SCALE = 0.10
+CROSS_GATE_SCALE = 0.05
+GATE_INIT = 0.10
 
 
 class FlowNet(nn.Module):
@@ -57,8 +67,8 @@ class FlowNet(nn.Module):
             })
             for _ in range(depth)
         ])
-        self.self_gates = nn.ParameterList([nn.Parameter(torch.zeros(())) for _ in range(depth)])
-        self.cross_gates = nn.ParameterList([nn.Parameter(torch.zeros(())) for _ in range(depth)])
+        self.self_gates = nn.ParameterList([nn.Parameter(torch.tensor(GATE_INIT)) for _ in range(depth)])
+        self.cross_gates = nn.ParameterList([nn.Parameter(torch.tensor(GATE_INIT)) for _ in range(depth)])
         self.out_norm = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, latent_dim)
 
@@ -113,7 +123,7 @@ class FlowNet(nn.Module):
                 key_padding_mask=self_key_padding_mask,
                 need_weights=False,
             )
-            h = h + self.self_gates[block_idx].tanh() * self_out
+            h = h + SELF_GATE_SCALE * self.self_gates[block_idx].tanh() * self_out
             if prompt_h is not None:
                 cross_in = block["cross_norm"](h)
                 cross_out, _ = block["cross_attn"](
@@ -123,7 +133,7 @@ class FlowNet(nn.Module):
                     key_padding_mask=prompt_key_padding_mask,
                     need_weights=False,
                 )
-                h = h + self.cross_gates[block_idx].tanh() * cross_out
+                h = h + CROSS_GATE_SCALE * self.cross_gates[block_idx].tanh() * cross_out
             if mask is not None:
                 h = h * mask.to(h.dtype).unsqueeze(-1)
 
@@ -150,6 +160,36 @@ def guided_velocity(flow_net, z, t, z_cond, pos, guidance_scale):
         v_uncond = flow_net(z, t, torch.zeros_like(z_cond), pos)
         v = v_uncond + guidance_scale * (v - v_uncond)
     return v
+
+
+def calibrate_latents(z, target_mean=TARGET_LATENT_MEAN, target_std=TARGET_LATENT_STD, eps=1e-6):
+    if not CALIBRATE_GENERATED_LATENTS:
+        return z
+    return (z - z.mean()) * (target_std / z.std().clamp_min(eps)) + target_mean
+
+
+def sample_token_ids(logits, tokenizer, temperature=DECODE_TEMPERATURE, top_k=DECODE_TOP_K, top_p=DECODE_TOP_P):
+    if temperature <= 0:
+        return logits.argmax(dim=-1)
+
+    logits = logits.float() / temperature
+    for token_id in tokenizer.all_special_ids:
+        logits[..., token_id] = -float("inf")
+
+    if top_k is not None and top_k > 0:
+        kth = logits.topk(min(top_k, logits.size(-1)), dim=-1).values[..., -1, None]
+        logits = logits.masked_fill(logits < kth, -float("inf"))
+
+    if top_p is not None and 0.0 < top_p < 1.0:
+        sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
+        sorted_probs = sorted_logits.softmax(dim=-1)
+        keep = sorted_probs.cumsum(dim=-1) <= top_p
+        keep[..., 0] = True
+        sorted_logits = sorted_logits.masked_fill(~keep, -float("inf"))
+        logits = torch.full_like(logits, -float("inf")).scatter(dim=-1, index=sorted_idx, src=sorted_logits)
+
+    probs = logits.softmax(dim=-1)
+    return torch.multinomial(probs.reshape(-1, probs.size(-1)), 1).view(logits.shape[:-1])
 
 
 def load_models(stage1_path="stage1_best.pt", stage2_path="stage2_conditional_best.pt"):
@@ -179,7 +219,12 @@ def load_models(stage1_path="stage1_best.pt", stage2_path="stage2_conditional_be
 
 @torch.no_grad()
 def generate(prompt_text, flow_net, encoder, decoder, tokenizer,
-             n_samples=4, seq_len=128, latent_dim=256, steps=100, guidance_scale=1.0, device=device):
+             n_samples=4, seq_len=128, latent_dim=256, steps=100,
+             guidance_scale=DEFAULT_GUIDANCE_SCALE,
+             temperature=DECODE_TEMPERATURE,
+             top_k=DECODE_TOP_K,
+             top_p=DECODE_TOP_P,
+             device=device):
     inputs = tokenizer(prompt_text, return_tensors="pt",
                        max_length=PROMPT_LEN, padding="max_length", truncation=True)
     input_ids      = inputs["input_ids"].to(device)
@@ -202,18 +247,19 @@ def generate(prompt_text, flow_net, encoder, decoder, tokenizer,
             t_next = torch.full((n_samples, suffix_len), min((i + 1) / steps, 1.0), device=device)
             v_next = guided_velocity(flow_net, z_euler, t_next, z_cond, pos, guidance_scale)
         z = z + 0.5 * (v + v_next) * dt
+    z = calibrate_latents(z)
 
     z_prompt = z_prompt.expand(n_samples, PROMPT_LEN, latent_dim)
     z_seq    = torch.cat([z_prompt, z], dim=1)
     with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
         logits = decoder.decode_from_latent(z_seq)
-    pred_ids = logits.argmax(-1)
+    pred_ids = sample_token_ids(logits, tokenizer, temperature=temperature, top_k=top_k, top_p=top_p)
     return [tokenizer.decode(pred_ids[i], skip_special_tokens=True)
             for i in range(n_samples)]
 
 
 @torch.no_grad()
-def diagnose(flow_net, encoder, decoder, tokenizer, device, steps=200, guidance_scale=1.0):
+def diagnose(flow_net, encoder, decoder, tokenizer, device, steps=200, guidance_scale=DEFAULT_GUIDANCE_SCALE):
     torch.manual_seed(42)
     noise = torch.randn(128, 256, device=device) * BASE_NOISE_STD
 
@@ -245,10 +291,11 @@ def diagnose(flow_net, encoder, decoder, tokenizer, device, steps=200, guidance_
             t_next = torch.full((1, 128 - PROMPT_LEN), min((i + 1) / steps, 1.0), device=device)
             v_next = guided_velocity(flow_net, z_euler, t_next, z_cond, pos, guidance_scale)
             z = z + 0.5 * (v + v_next) * dt
+        z = calibrate_latents(z)
 
         z_seq = torch.cat([z_prompt, z], dim=1)
         logits   = decoder.decode_from_latent(z_seq)
-        pred_ids = logits.argmax(-1)
+        pred_ids = sample_token_ids(logits, tokenizer, temperature=DECODE_TEMPERATURE, top_k=DECODE_TOP_K, top_p=DECODE_TOP_P)
         print(f"  prompt:    {prompt}")
         print(f"  generated: {tokenizer.decode(pred_ids[0], skip_special_tokens=True)[:100]}")
         print(f"  latent:    mean={z.mean().item():.3f} std={z.std().item():.3f}")
@@ -259,7 +306,7 @@ if __name__ == "__main__":
     tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
     encoder, decoder, flow_net = load_models()
 
-    diagnose(flow_net, encoder, decoder, tokenizer, device, steps=200, guidance_scale=1.0)
+    diagnose(flow_net, encoder, decoder, tokenizer, device, steps=200, guidance_scale=DEFAULT_GUIDANCE_SCALE)
 
     print("\ninteractive mode — press Ctrl+C to exit\n")
     while True:
@@ -269,9 +316,15 @@ if __name__ == "__main__":
                 continue
             n = int(input("samples? [default 2]: ") or 2)
             s = int(input("steps?   [default 100]: ") or 100)
-            g = float(input("guidance? [default 1.0]: ") or 1.0)
+            g = float(input(f"guidance? [default {DEFAULT_GUIDANCE_SCALE}]: ") or DEFAULT_GUIDANCE_SCALE)
+            temp = float(input(f"temperature? [default {DECODE_TEMPERATURE}, 0=argmax]: ") or DECODE_TEMPERATURE)
+            top_k = int(input(f"top_k? [default {DECODE_TOP_K}, 0=off]: ") or DECODE_TOP_K)
+            top_p = float(input(f"top_p? [default {DECODE_TOP_P}, 0=off]: ") or DECODE_TOP_P)
+            top_k = None if top_k <= 0 else top_k
+            top_p = None if top_p <= 0 else top_p
             texts = generate(prompt, flow_net, encoder, decoder, tokenizer,
-                             n_samples=n, steps=s, guidance_scale=g)
+                             n_samples=n, steps=s, guidance_scale=g,
+                             temperature=temp, top_k=top_k, top_p=top_p)
             print()
             for i, text in enumerate(texts):
                 print(f"  [{i+1}] {text}\n")
