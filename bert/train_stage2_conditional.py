@@ -1,5 +1,4 @@
 import sys
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,7 +22,6 @@ CALIBRATE_GENERATED_LATENTS = True
 TARGET_LATENT_MEAN = -0.003
 TARGET_LATENT_STD = 0.264
 GENERATION_GUIDANCE_SCALE = 1.5
-USE_OT = False
 COMPILE_MODELS = False
 FAST_DEBUG = False
 TRAIN_SIZE = 1000000
@@ -32,23 +30,13 @@ FLOW_HIDDEN_DIM = 512
 FLOW_DEPTH = 5
 METRIC_HIDDEN_DIM = 256
 LOG_EVERY = 50
-OT_EPS = 0.05
-OT_ITERS = 30
-METRIC_REG = 1e-4
-METRIC_LOG_BOUND = 1.0
-METRIC_LOSS_WEIGHT = 0.0
-EUCLIDEAN_LOSS_WEIGHT = 1.0
+METRIC_LOSS_WEIGHT = 1.0
+EUCLIDEAN_LOSS_WEIGHT = 0.0
 X0_LOSS_WEIGHT = 1.0
 DECODE_LOSS_WEIGHT = 0.03
 DECODE_LOSS_BATCH = 64
-DECODE_LABEL_SMOOTHING = 0.05
-SAMPLED_DECODE_LOSS_WEIGHT = 0.01
-SAMPLED_DECODE_WARMUP_STEPS = 1000
-SAMPLED_DECODE_BATCH = 4
-SAMPLED_DECODE_STEPS = 8
-SAMPLED_LATENT_LOSS_WEIGHT = 1.0
-SAMPLED_STD_LOSS_WEIGHT = 1.0
-SAMPLED_MOMENT_LOSS_WEIGHT = 0.5
+METRIC_REG = 1e-4
+METRIC_LOG_BOUND = 1.0
 SELF_GATE_SCALE = 0.10
 CROSS_GATE_SCALE = 0.10
 GATE_INIT = 0.20
@@ -195,7 +183,7 @@ class FlowNet(nn.Module):
 
 
 class MetricNet(nn.Module):
-    def __init__(self, latent_dim=256, hidden_dim=512, log_bound=METRIC_LOG_BOUND):
+    def __init__(self, latent_dim=256, hidden_dim=METRIC_HIDDEN_DIM, log_bound=METRIC_LOG_BOUND):
         super().__init__()
         self.log_bound = log_bound
         self.net = nn.Sequential(
@@ -212,18 +200,13 @@ class MetricNet(nn.Module):
         log_g = log_g - log_g.mean(dim=-1, keepdim=True)
         log_g = log_g.clamp(-self.log_bound, self.log_bound)
         g_diag = torch.exp(log_g)
-        g_diag = g_diag / g_diag.mean(dim=-1, keepdim=True).clamp_min(1e-6)
-        return g_diag
+        return g_diag / g_diag.mean(dim=-1, keepdim=True).clamp_min(1e-6)
 
 
 def prompt_condition(z_data, attention_mask, prompt_len=PROMPT_LEN):
     prompt_z = z_data[:, :prompt_len, :]
     prompt_mask = attention_mask[:, :prompt_len].to(prompt_z.dtype).unsqueeze(-1)
     return prompt_z * prompt_mask
-
-
-def pool_prompt_condition(z_cond):
-    return z_cond.mean(dim=1)
 
 
 def suffix_positions(batch_size, suffix_len, device, dtype=torch.float32):
@@ -247,27 +230,6 @@ def attention_gate_regularizer(flow_net):
     return GATE_REG_WEIGHT * (self_reg + cross_reg)
 
 
-def masked_mean_std(x, mask=None, dim=(0, 1), eps=1e-6):
-    if mask is None:
-        mean = x.mean(dim=dim)
-        var = (x - mean.view(1, 1, -1)).pow(2).mean(dim=dim)
-        return mean, var.add(eps).sqrt()
-
-    weights = mask.to(x.dtype).unsqueeze(-1)
-    denom = weights.sum(dim=dim).clamp_min(1.0)
-    mean = (x * weights).sum(dim=dim) / denom
-    var = ((x - mean.view(1, 1, -1)).pow(2) * weights).sum(dim=dim) / denom
-    return mean, var.add(eps).sqrt()
-
-
-def flow_heun_step(flow_net, z, t, z_cond, pos, dt, mask=None):
-    v = flow_net(z, t, z_cond, pos, mask)
-    z_euler = z + v * dt
-    t_next = (t + dt).clamp(max=1.0)
-    v_next = flow_net(z_euler, t_next, z_cond, pos, mask)
-    return z + 0.5 * (v + v_next) * dt
-
-
 def calibrate_latents(z, mask=None, target_mean=TARGET_LATENT_MEAN, target_std=TARGET_LATENT_STD, eps=1e-6):
     if not CALIBRATE_GENERATED_LATENTS:
         return z
@@ -285,32 +247,6 @@ def calibrate_latents(z, mask=None, target_mean=TARGET_LATENT_MEAN, target_std=T
     return (z - mean) * (target_std / std) + target_mean
 
 
-def sinkhorn_ot_barycentric_targets(z_noise, z_target, target_mask=None, eps=OT_EPS, iters=OT_ITERS):
-    B, T, _ = z_target.shape
-    dtype = z_target.dtype
-    device = z_target.device
-
-    cost = torch.cdist(z_noise.float(), z_target.float(), p=2).pow(2)
-    if target_mask is None:
-        target_mask = torch.ones(B, T, device=device, dtype=dtype)
-    valid = target_mask.to(dtype)
-    cost = cost.masked_fill(valid[:, None, :] == 0, 1e4)
-
-    log_k = -cost / eps
-    log_a = torch.full((B, T), -math.log(T), device=device)
-    b = valid / valid.sum(dim=1, keepdim=True).clamp_min(1.0)
-    log_b = torch.log(b.clamp_min(1e-8))
-
-    u = torch.zeros_like(log_a)
-    v = torch.zeros_like(log_b)
-    for _ in range(iters):
-        u = log_a - torch.logsumexp(log_k + v[:, None, :], dim=2)
-        v = log_b - torch.logsumexp(log_k + u[:, :, None], dim=1)
-
-    plan = torch.exp(log_k + u[:, :, None] + v[:, None, :]).to(dtype)
-    return torch.bmm(plan * T, z_target)
-
-
 def flow_matching_loss(
     flow_net,
     metric_net,
@@ -320,7 +256,6 @@ def flow_matching_loss(
     decoder=None,
     z_prompt=None,
     suffix_ids=None,
-    global_step=0,
     return_stats=False,
 ):
     if target_mask is not None:
@@ -329,15 +264,10 @@ def flow_matching_loss(
             zero = next(flow_net.parameters()).sum() + next(metric_net.parameters()).sum()
             if return_stats:
                 return zero * 0.0, {
-                    "euclidean_loss": 0.0,
                     "metric_loss": 0.0,
+                    "euclidean_loss": 0.0,
                     "decode_loss": 0.0,
-                    "sampled_decode_loss": 0.0,
-                    "sampled_latent_loss": 0.0,
-                    "sampled_std_loss": 0.0,
-                    "sampled_moment_loss": 0.0,
                     "x0_loss": 0.0,
-                    "sampled_decode_weight": 0.0,
                     "metric_mean": 0.0,
                     "metric_std": 0.0,
                     "self_gate": 0.0,
@@ -355,9 +285,6 @@ def flow_matching_loss(
 
     B, T, D = z_target.shape
     z_noise_seq = torch.randn_like(z_target) * BASE_NOISE_STD
-    if USE_OT:
-        z_target = sinkhorn_ot_barycentric_targets(z_noise_seq, z_target, target_mask)
-
     pos_seq = suffix_positions(B, T, z_target.device, z_target.dtype)
     t_seq = torch.rand(B, T, device=z_target.device).pow(2)
     z_t_seq = (1 - t_seq.unsqueeze(-1)) * z_noise_seq + t_seq.unsqueeze(-1) * z_target
@@ -367,7 +294,7 @@ def flow_matching_loss(
 
     z_flat = z_target.reshape(B * T, D)
     z_x0_pred_flat = z_x0_pred_seq.reshape(B * T, D)
-    pooled_cond = pool_prompt_condition(z_cond)
+    pooled_cond = z_cond.mean(dim=1)
     cond_flat = pooled_cond.unsqueeze(1).expand(-1, T, -1).reshape(B * T, D)
     z_t_flat = z_t_seq.reshape(B * T, D)
     v_true_flat = v_true_seq.reshape(B * T, D)
@@ -388,15 +315,10 @@ def flow_matching_loss(
     g_diag = metric_net(z_t_flat, t_flat, cond_flat, pos_flat)
     err = (v_pred_flat - v_true_flat).pow(2)
     euclidean_loss = err.mean()
-    x0_loss = F.mse_loss(z_x0_pred_flat, z_flat)
     metric_loss = (g_diag * err).mean(dim=-1).mean()
     metric_reg = METRIC_REG * g_diag.log().pow(2).mean()
+    x0_loss = F.mse_loss(z_x0_pred_flat, z_flat)
     decode_loss = z_target.new_tensor(0.0)
-    sampled_decode_loss = z_target.new_tensor(0.0)
-    sampled_latent_loss = z_target.new_tensor(0.0)
-    sampled_std_loss = z_target.new_tensor(0.0)
-    sampled_moment_loss = z_target.new_tensor(0.0)
-    sampled_decode_weight = min(1.0, global_step / max(SAMPLED_DECODE_WARMUP_STEPS, 1)) * SAMPLED_DECODE_LOSS_WEIGHT
     gate_reg = attention_gate_regularizer(flow_net)
     if decoder is not None and z_prompt is not None and suffix_ids is not None and DECODE_LOSS_WEIGHT > 0:
         n_decode = min(DECODE_LOSS_BATCH, B)
@@ -407,94 +329,21 @@ def flow_matching_loss(
         suffix_targets = suffix_ids[:n_decode].reshape(-1)
         decode_loss = F.cross_entropy(suffix_logits, suffix_targets, ignore_index=0)
 
-    if (
-        z_prompt is not None
-        and suffix_ids is not None
-        and (SAMPLED_DECODE_LOSS_WEIGHT > 0 or SAMPLED_LATENT_LOSS_WEIGHT > 0)
-    ):
-        n_sampled = min(SAMPLED_DECODE_BATCH, B)
-        z_sampled = z_noise_seq[:n_sampled]
-        z_cond_sampled = z_cond[:n_sampled]
-        pos_sampled = pos_seq[:n_sampled]
-        dt = 1.0 / SAMPLED_DECODE_STEPS
-        for i in range(SAMPLED_DECODE_STEPS):
-            t_sampled = torch.full(
-                (n_sampled, T),
-                i / SAMPLED_DECODE_STEPS,
-                device=z_target.device,
-                dtype=z_target.dtype,
-            )
-            sampled_mask = target_mask[:n_sampled] if target_mask is not None else None
-            z_sampled = flow_heun_step(
-                flow_net,
-                z_sampled,
-                t_sampled,
-                z_cond_sampled,
-                pos_sampled,
-                dt,
-                sampled_mask,
-            )
-
-        z_sampled_seq = torch.cat([z_prompt[:n_sampled], z_sampled], dim=1)
-        sampled_err = (z_sampled - z_target[:n_sampled]).pow(2)
-        if target_mask is not None:
-            sampled_valid = target_mask[:n_sampled].to(sampled_err.dtype).unsqueeze(-1)
-            sampled_latent_loss = (sampled_err * sampled_valid).sum() / sampled_valid.sum().clamp_min(1.0) / D
-            sampled_std = z_sampled[target_mask[:n_sampled].bool()].std()
-            target_std = z_target[:n_sampled][target_mask[:n_sampled].bool()].std()
-        else:
-            sampled_latent_loss = sampled_err.mean()
-            sampled_std = z_sampled.std()
-            target_std = z_target[:n_sampled].std()
-        sampled_std_loss = (sampled_std - target_std.detach()).pow(2)
-        sampled_mean_dim, sampled_std_dim = masked_mean_std(
-            z_sampled,
-            target_mask[:n_sampled] if target_mask is not None else None,
-        )
-        target_mean_dim, target_std_dim = masked_mean_std(
-            z_target[:n_sampled],
-            target_mask[:n_sampled] if target_mask is not None else None,
-        )
-        sampled_moment_loss = (
-            F.mse_loss(sampled_mean_dim, target_mean_dim.detach())
-            + F.mse_loss(sampled_std_dim, target_std_dim.detach())
-        )
-
-        if decoder is not None and sampled_decode_weight > 0:
-            sampled_logits = decoder.decode_from_latent(z_sampled_seq)
-            sampled_suffix_logits = sampled_logits[:, PROMPT_LEN:, :].reshape(-1, sampled_logits.size(-1))
-            sampled_suffix_targets = suffix_ids[:n_sampled].reshape(-1)
-            sampled_decode_loss = F.cross_entropy(
-                sampled_suffix_logits,
-                sampled_suffix_targets,
-                ignore_index=0,
-                label_smoothing=DECODE_LABEL_SMOOTHING,
-            )
-
     total_loss = (
         METRIC_LOSS_WEIGHT * metric_loss
         + EUCLIDEAN_LOSS_WEIGHT * euclidean_loss
         + X0_LOSS_WEIGHT * x0_loss
         + DECODE_LOSS_WEIGHT * decode_loss
-        + sampled_decode_weight * sampled_decode_loss
-        + SAMPLED_LATENT_LOSS_WEIGHT * sampled_latent_loss
-        + SAMPLED_STD_LOSS_WEIGHT * sampled_std_loss
-        + SAMPLED_MOMENT_LOSS_WEIGHT * sampled_moment_loss
         + gate_reg
         + metric_reg
     )
     if return_stats:
         self_gate, cross_gate = attention_gate_stats(flow_net)
         return total_loss, {
-            "euclidean_loss": euclidean_loss.detach().item(),
             "metric_loss": metric_loss.detach().item(),
+            "euclidean_loss": euclidean_loss.detach().item(),
             "x0_loss": x0_loss.detach().item(),
             "decode_loss": decode_loss.detach().item(),
-            "sampled_decode_loss": sampled_decode_loss.detach().item(),
-            "sampled_decode_weight": float(sampled_decode_weight),
-            "sampled_latent_loss": sampled_latent_loss.detach().item(),
-            "sampled_std_loss": sampled_std_loss.detach().item(),
-            "sampled_moment_loss": sampled_moment_loss.detach().item(),
             "metric_mean": g_diag.detach().mean().item(),
             "metric_std": g_diag.detach().std().item(),
             "self_gate": self_gate,
@@ -582,7 +431,7 @@ def evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, devi
         real_std   = z_real_flat.std().item()
         gen_mean   = z_gen_flat.mean().item()
         gen_std    = z_gen_flat.std().item()
-        metric_cond = pool_prompt_condition(z_cond).unsqueeze(1).expand(-1, S - PROMPT_LEN, -1)[suffix_mask]
+        metric_cond = z_cond.mean(dim=1).unsqueeze(1).expand(-1, S - PROMPT_LEN, -1)[suffix_mask]
         metric_t = torch.full((z_gen_flat.size(0),), 0.5, device=device)
         metric_pos = suffix_positions(B, S - PROMPT_LEN, device)[suffix_mask]
         metric_diag = metric_net(z_gen_flat, metric_t, metric_cond, metric_pos)
@@ -724,7 +573,6 @@ for epoch in range(EPOCHS):
     train_loss = 0
 
     for step, batch in enumerate(train_loader):
-        global_step = epoch * len(train_loader) + step
         input_ids      = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
 
@@ -742,7 +590,6 @@ for epoch in range(EPOCHS):
                 decoder=decoder,
                 z_prompt=z_data[:, :PROMPT_LEN, :],
                 suffix_ids=input_ids[:, PROMPT_LEN:],
-                global_step=global_step,
                 return_stats=True,
             )
 
@@ -765,12 +612,7 @@ for epoch in range(EPOCHS):
                 f" | eloss {stats['euclidean_loss']:.4f}"
                 f" | x0 {stats['x0_loss']:.4f}"
                 f" | dloss {stats['decode_loss']:.4f}"
-                f" | sdloss {stats['sampled_decode_loss']:.4f}"
-                f"@{stats['sampled_decode_weight']:.4f}"
-                f" | slloss {stats['sampled_latent_loss']:.4f}"
-                f" | ssloss {stats['sampled_std_loss']:.4f}"
-                f" | smloss {stats['sampled_moment_loss']:.4f}"
-                f" | metric {stats['metric_mean']:.3f}±{stats['metric_std']:.3f}",
+                f" | metric {stats['metric_mean']:.3f}±{stats['metric_std']:.3f}"
                 f" | gates s={stats['self_gate']:.4f} c={stats['cross_gate']:.4f}",
                 f" | greg {stats['gate_reg']:.5f}",
                 flush=True,
@@ -789,28 +631,17 @@ for epoch in range(EPOCHS):
             "encoder":  encoder.state_dict(),
             "best_loss": avg_val_loss,
             "best_score": best_score,
-            "ot_eps": OT_EPS,
-            "ot_iters": OT_ITERS,
             "metric_loss_weight": METRIC_LOSS_WEIGHT,
-            "metric_reg": METRIC_REG,
-            "metric_log_bound": METRIC_LOG_BOUND,
             "euclidean_loss_weight": EUCLIDEAN_LOSS_WEIGHT,
             "x0_loss_weight": X0_LOSS_WEIGHT,
             "decode_loss_weight": DECODE_LOSS_WEIGHT,
             "decode_loss_batch": DECODE_LOSS_BATCH,
-            "decode_label_smoothing": DECODE_LABEL_SMOOTHING,
-            "sampled_decode_loss_weight": SAMPLED_DECODE_LOSS_WEIGHT,
-            "sampled_decode_warmup_steps": SAMPLED_DECODE_WARMUP_STEPS,
-            "sampled_decode_batch": SAMPLED_DECODE_BATCH,
-            "sampled_decode_steps": SAMPLED_DECODE_STEPS,
-            "sampled_latent_loss_weight": SAMPLED_LATENT_LOSS_WEIGHT,
-            "sampled_std_loss_weight": SAMPLED_STD_LOSS_WEIGHT,
-            "sampled_moment_loss_weight": SAMPLED_MOMENT_LOSS_WEIGHT,
+            "metric_reg": METRIC_REG,
+            "metric_log_bound": METRIC_LOG_BOUND,
             "self_gate_scale": SELF_GATE_SCALE,
             "cross_gate_scale": CROSS_GATE_SCALE,
             "gate_init": GATE_INIT,
             "gate_reg_weight": GATE_REG_WEIGHT,
-            "use_ot": USE_OT,
             "max_seq_len": MAX_SEQ_LEN,
             "base_noise_std": BASE_NOISE_STD,
             "calibrate_generated_latents": CALIBRATE_GENERATED_LATENTS,
@@ -821,6 +652,6 @@ for epoch in range(EPOCHS):
             "flow_depth": FLOW_DEPTH,
             "metric_hidden_dim": METRIC_HIDDEN_DIM,
             "train_size": TRAIN_SIZE,
-            "prompt_condition": "capped_prompt_suffix_attention_v4",
+            "prompt_condition": "riemannian_prompt_prefix",
         }, "stage2_conditional_best.pt")
         print(f"saved best model at val score {best_score:.4f} | flow loss {avg_val_loss:.4f}\n", flush=True)
