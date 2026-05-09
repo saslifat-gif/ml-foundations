@@ -43,21 +43,35 @@ EUCLIDEAN_LOSS_WEIGHT = 0.05
 X0_LOSS_WEIGHT = 0.25
 DECODE_LOSS_WEIGHT = 0.05
 DECODE_LOSS_BATCH = 128
-ROLLOUT_LOSS_WEIGHT = 0.50
+ROLLOUT_LOSS_WEIGHT = 0.25
 ROLLOUT_DECODE_LOSS_WEIGHT = 0.05
 ROLLOUT_HIDDEN_LOSS_WEIGHT = 0.0
 ROLLOUT_LOGIT_KL_WEIGHT = 0.0
 ROLLOUT_LOGIT_KL_TEMP = 2.0
-ROLLOUT_NORM_LOSS_WEIGHT = 0.05
-ROLLOUT_DIVERSITY_LOSS_WEIGHT = 0.10
+ROLLOUT_ENTROPY_LOSS_WEIGHT = 0.005
+ROLLOUT_ENTROPY_MARGIN = 0.0
+ROLLOUT_ENTROPY_FULL_EPOCHS = 20
+ROLLOUT_ENTROPY_DECAY_EPOCHS = 0
+ROLLOUT_GATED_GEN_CE_WEIGHT = 0.01
+ROLLOUT_GATED_GEN_CE_TOP1_CAP = 0.25
+ROLLOUT_GATED_GEN_CE_ENTROPY_MARGIN = 1.0
+ROLLOUT_TARGET_PROB_WEIGHT = 0.005
+ROLLOUT_TARGET_PROB_MARGIN = 0.20
+ROLLOUT_TARGET_PROB_TOP1_CAP = 0.50
+ROLLOUT_LOGIT_BALANCE_WEIGHT = 0.0
+ROLLOUT_LOGIT_BALANCE_TOPK = 8
+ROLLOUT_LOGIT_BALANCE_TARGET = 0.08
+LOGIT_BALANCE_SPECIAL_IDS = (0, 100, 101, 102, 103)
+ROLLOUT_NORM_LOSS_WEIGHT = 0.025
+ROLLOUT_DIVERSITY_LOSS_WEIGHT = 0.01
 ROLLOUT_DIVERSITY_MAX_TOKENS = 512
-ROLLOUT_BATCH = 128
-ROLLOUT_TRAIN_STEPS = 4
+ROLLOUT_BATCH = 64
+ROLLOUT_TRAIN_STEPS = 8
 RAW_NORM_GAP_SCORE_WEIGHT = 0.05
 COLLAPSE_UNIQ_TARGET = 0.25
 COLLAPSE_MAXFRAC_TARGET = 0.50
-COLLAPSE_UNIQ_SCORE_WEIGHT = 1.0
-COLLAPSE_MAXFRAC_SCORE_WEIGHT = 1.0
+COLLAPSE_UNIQ_SCORE_WEIGHT = 2.0
+COLLAPSE_MAXFRAC_SCORE_WEIGHT = 2.0
 METRIC_REG = 1e-4
 METRIC_WARMUP_REG_MULT = 100.0
 METRIC_WARMUP_STEPS = 1000
@@ -68,11 +82,15 @@ GATE_INIT = 0.50
 GATE_REG_WEIGHT = 0.0
 GATE_LR_MULT = 20.0
 ODE_STEPS = 16
+EVAL_SAMPLE_TEMPERATURE = 0.8
+EVAL_SAMPLE_TOP_K = 50
+EVAL_SAMPLE_TOP_P = 0.95
 DECODER_ADAPT = True
-DECODER_ADAPT_LR = 2e-6
+DECODER_ADAPT_LR = 1e-6
 DECODER_ADAPT_REAL_CE_WEIGHT = 0.10
-DECODER_ADAPT_GEN_CE_WEIGHT = 0.10
-DECODER_ADAPT_PRESERVE_KL_WEIGHT = 0.05
+DECODER_ADAPT_GEN_CE_WEIGHT = 0.05
+DECODER_ADAPT_GEN_CE_RAMP_EPOCHS = 2
+DECODER_ADAPT_PRESERVE_KL_WEIGHT = 0.10
 DECODER_ADAPT_KL_TEMP = 2.0
 DECODER_ADAPT_MODULES = ("project_up", "to_logits")
 # -----------------------------------------------------------------------------
@@ -477,6 +495,185 @@ def pairwise_distance_match_loss(z_pred, z_target, mask=None, max_tokens=ROLLOUT
     return F.smooth_l1_loss(pred_dist / scale, target_dist / scale)
 
 
+def logit_balance_loss(
+    logits,
+    mask=None,
+    topk=ROLLOUT_LOGIT_BALANCE_TOPK,
+    target=ROLLOUT_LOGIT_BALANCE_TARGET,
+):
+    suffix_logits = logits[:, PROMPT_LEN:, :].float()
+    probs = suffix_logits.softmax(dim=-1)
+    if mask is not None:
+        valid = mask.bool()
+        if not valid.any():
+            return logits.new_tensor(0.0), 0.0
+        probs = probs[valid]
+    else:
+        probs = probs.reshape(-1, probs.size(-1))
+    probs = probs.clone()
+    special_ids = torch.tensor(LOGIT_BALANCE_SPECIAL_IDS, device=probs.device)
+    probs[:, special_ids] = 0.0
+    mean_probs = probs.mean(dim=0)
+    top_mass = mean_probs.topk(min(topk, mean_probs.numel())).values.sum()
+    return (top_mass - target).clamp_min(0.0).pow(2), top_mass.detach().item()
+
+
+def entropy_weight_multiplier(global_step=None, steps_per_epoch=None):
+    if global_step is None or not steps_per_epoch:
+        return 1.0
+    full_steps = max(0, int(ROLLOUT_ENTROPY_FULL_EPOCHS * steps_per_epoch))
+    decay_steps = max(0, int(ROLLOUT_ENTROPY_DECAY_EPOCHS * steps_per_epoch))
+    if global_step < full_steps:
+        return 1.0
+    if decay_steps <= 0:
+        return 0.0
+    return max(0.0, 1.0 - (global_step - full_steps) / decay_steps)
+
+
+def entropy_gap_loss(gen_logits, oracle_logits, mask=None, margin=ROLLOUT_ENTROPY_MARGIN):
+    gen_probs = gen_logits[:, PROMPT_LEN:, :].float().softmax(dim=-1)
+    oracle_probs = oracle_logits[:, PROMPT_LEN:, :].float().softmax(dim=-1)
+    gen_entropy = -(gen_probs * gen_probs.clamp_min(1e-9).log()).sum(dim=-1)
+    oracle_entropy = -(oracle_probs * oracle_probs.clamp_min(1e-9).log()).sum(dim=-1)
+    if mask is not None:
+        valid = mask.bool()
+        if not valid.any():
+            return gen_logits.new_tensor(0.0), 0.0, 0.0
+        gen_entropy = gen_entropy[valid]
+        oracle_entropy = oracle_entropy[valid]
+    excess_entropy = (gen_entropy - oracle_entropy.detach() - margin).clamp_min(0.0)
+    return (
+        F.smooth_l1_loss(excess_entropy, torch.zeros_like(excess_entropy)),
+        gen_entropy.detach().mean().item(),
+        oracle_entropy.detach().mean().item(),
+    )
+
+
+def gated_generated_ce_loss(
+    gen_logits,
+    oracle_logits,
+    suffix_ids,
+    mask=None,
+    entropy_margin=ROLLOUT_GATED_GEN_CE_ENTROPY_MARGIN,
+    top1_cap=ROLLOUT_GATED_GEN_CE_TOP1_CAP,
+):
+    suffix_logits = gen_logits[:, PROMPT_LEN:, :].float()
+    oracle_probs = oracle_logits[:, PROMPT_LEN:, :].float().softmax(dim=-1)
+    gen_probs = suffix_logits.softmax(dim=-1)
+    gen_entropy = -(gen_probs * gen_probs.clamp_min(1e-9).log()).sum(dim=-1)
+    oracle_entropy = -(oracle_probs * oracle_probs.clamp_min(1e-9).log()).sum(dim=-1)
+    gen_top1 = gen_probs.max(dim=-1).values
+
+    suffix_targets = suffix_ids[:gen_logits.size(0)]
+    valid = suffix_targets != 0
+    if mask is not None:
+        valid = valid & mask.bool()
+    if not valid.any():
+        return gen_logits.new_tensor(0.0), 0.0, 0.0
+
+    active = (
+        (gen_entropy > oracle_entropy.detach() + entropy_margin)
+        & (gen_top1 < top1_cap)
+        & valid
+    )
+    mean_top1 = gen_top1[valid].detach().mean().item()
+    active_frac = active.float()[valid].mean().item()
+    if not active.any():
+        return gen_logits.new_tensor(0.0), active_frac, mean_top1
+
+    token_ce = F.cross_entropy(
+        suffix_logits.reshape(-1, suffix_logits.size(-1)),
+        suffix_targets.reshape(-1),
+        ignore_index=0,
+        reduction="none",
+    ).reshape_as(gen_entropy)
+    return token_ce[active].mean(), active_frac, mean_top1
+
+
+def target_probability_loss(
+    gen_logits,
+    oracle_logits,
+    suffix_ids,
+    mask=None,
+    margin=ROLLOUT_TARGET_PROB_MARGIN,
+    top1_cap=ROLLOUT_TARGET_PROB_TOP1_CAP,
+):
+    suffix_logits = gen_logits[:, PROMPT_LEN:, :].float()
+    gen_probs = suffix_logits.softmax(dim=-1)
+    with torch.no_grad():
+        oracle_probs = oracle_logits[:, PROMPT_LEN:, :].float().softmax(dim=-1)
+    gen_top1 = gen_probs.max(dim=-1).values
+
+    suffix_targets = suffix_ids[:gen_logits.size(0)]
+    valid = suffix_targets != 0
+    if mask is not None:
+        valid = valid & mask.bool()
+    if not valid.any():
+        return gen_logits.new_tensor(0.0), 0.0, 0.0, 0.0
+
+    target_gather_ids = suffix_targets.clamp(0, gen_probs.size(-1) - 1).unsqueeze(-1)
+    gen_target_prob = gen_probs.gather(dim=-1, index=target_gather_ids).squeeze(-1)
+    oracle_target_prob = oracle_probs.gather(dim=-1, index=target_gather_ids).squeeze(-1)
+    active = (
+        ((oracle_target_prob.detach() - gen_target_prob) > margin)
+        & (gen_top1 < top1_cap)
+        & valid
+    )
+    active_frac = active.float()[valid].mean().item()
+    mean_gen_target_prob = gen_target_prob[valid].detach().mean().item()
+    mean_oracle_target_prob = oracle_target_prob[valid].detach().mean().item()
+    if not active.any():
+        return (
+            gen_logits.new_tensor(0.0),
+            active_frac,
+            mean_gen_target_prob,
+            mean_oracle_target_prob,
+        )
+
+    token_ce = F.cross_entropy(
+        suffix_logits.reshape(-1, suffix_logits.size(-1)),
+        suffix_targets.reshape(-1),
+        ignore_index=0,
+        reduction="none",
+    ).reshape_as(gen_target_prob)
+    return (
+        token_ce[active].mean(),
+        active_frac,
+        mean_gen_target_prob,
+        mean_oracle_target_prob,
+    )
+
+
+def sample_token_ids(
+    logits,
+    tokenizer,
+    temperature=EVAL_SAMPLE_TEMPERATURE,
+    top_k=EVAL_SAMPLE_TOP_K,
+    top_p=EVAL_SAMPLE_TOP_P,
+):
+    if temperature <= 0:
+        return logits.argmax(dim=-1)
+
+    logits = logits.float() / temperature
+    for token_id in tokenizer.all_special_ids:
+        logits[..., token_id] = -float("inf")
+
+    if top_k is not None and top_k > 0:
+        kth = logits.topk(min(top_k, logits.size(-1)), dim=-1).values[..., -1, None]
+        logits = logits.masked_fill(logits < kth, -float("inf"))
+
+    if top_p is not None and 0.0 < top_p < 1.0:
+        sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
+        sorted_probs = sorted_logits.softmax(dim=-1)
+        keep = sorted_probs.cumsum(dim=-1) <= top_p
+        keep[..., 0] = True
+        sorted_logits = sorted_logits.masked_fill(~keep, -float("inf"))
+        logits = torch.full_like(logits, -float("inf")).scatter(dim=-1, index=sorted_idx, src=sorted_logits)
+
+    probs = logits.softmax(dim=-1)
+    return torch.multinomial(probs.reshape(-1, probs.size(-1)), 1).view(logits.shape[:-1])
+
+
 def flow_matching_loss(
     flow_net,
     metric_net,
@@ -488,6 +685,7 @@ def flow_matching_loss(
     suffix_ids=None,
     teacher_decoder=None,
     global_step=None,
+    steps_per_epoch=None,
     return_stats=False,
 ):
     if target_mask is not None:
@@ -514,12 +712,30 @@ def flow_matching_loss(
                     "weighted_rollout_hidden_loss": 0.0,
                     "rollout_logit_kl": 0.0,
                     "weighted_rollout_logit_kl": 0.0,
+                    "rollout_entropy_loss": 0.0,
+                    "weighted_rollout_entropy_loss": 0.0,
+                    "rollout_entropy_mult": 0.0,
+                    "rollout_gen_entropy": 0.0,
+                    "rollout_oracle_entropy": 0.0,
+                    "rollout_gated_gen_ce": 0.0,
+                    "weighted_rollout_gated_gen_ce": 0.0,
+                    "rollout_gated_gen_ce_active": 0.0,
+                    "rollout_gated_gen_ce_top1": 0.0,
+                    "rollout_target_prob_loss": 0.0,
+                    "weighted_rollout_target_prob_loss": 0.0,
+                    "rollout_target_prob_active": 0.0,
+                    "rollout_target_prob_gen": 0.0,
+                    "rollout_target_prob_oracle": 0.0,
+                    "rollout_logit_balance": 0.0,
+                    "weighted_rollout_logit_balance": 0.0,
+                    "rollout_logit_topmass": 0.0,
                     "rollout_norm_loss": 0.0,
                     "rollout_diversity_loss": 0.0,
                     "weighted_rollout_diversity_loss": 0.0,
                     "decoder_adapt_real_ce": 0.0,
                     "weighted_decoder_adapt_real_ce": 0.0,
                     "decoder_adapt_gen_ce": 0.0,
+                    "decoder_adapt_gen_ce_mult": 0.0,
                     "weighted_decoder_adapt_gen_ce": 0.0,
                     "decoder_adapt_preserve_kl": 0.0,
                     "weighted_decoder_adapt_preserve_kl": 0.0,
@@ -583,11 +799,28 @@ def flow_matching_loss(
     rollout_decode_loss = z_target.new_tensor(0.0)
     rollout_hidden_loss = z_target.new_tensor(0.0)
     rollout_logit_kl = z_target.new_tensor(0.0)
+    rollout_entropy_loss = z_target.new_tensor(0.0)
+    rollout_entropy_mult = entropy_weight_multiplier(global_step, steps_per_epoch)
+    rollout_gen_entropy = 0.0
+    rollout_oracle_entropy = 0.0
+    rollout_gated_gen_ce = z_target.new_tensor(0.0)
+    rollout_gated_gen_ce_active = 0.0
+    rollout_gated_gen_ce_top1 = 0.0
+    rollout_target_prob_loss = z_target.new_tensor(0.0)
+    rollout_target_prob_active = 0.0
+    rollout_target_prob_gen = 0.0
+    rollout_target_prob_oracle = 0.0
+    rollout_logit_balance = z_target.new_tensor(0.0)
+    rollout_logit_topmass = 0.0
     rollout_norm_loss = z_target.new_tensor(0.0)
     rollout_diversity_loss = z_target.new_tensor(0.0)
     decoder_adapt_real_ce = z_target.new_tensor(0.0)
     decoder_adapt_gen_ce = z_target.new_tensor(0.0)
     decoder_adapt_preserve_kl = z_target.new_tensor(0.0)
+    decoder_adapt_gen_ce_mult = 1.0
+    if DECODER_ADAPT_GEN_CE_RAMP_EPOCHS > 0 and global_step is not None and steps_per_epoch:
+        ramp_steps = max(1, int(DECODER_ADAPT_GEN_CE_RAMP_EPOCHS * steps_per_epoch))
+        decoder_adapt_gen_ce_mult = min(1.0, (global_step + 1) / ramp_steps)
     if ROLLOUT_LOSS_WEIGHT > 0 and ROLLOUT_TRAIN_STEPS > 0:
         n_rollout = min(ROLLOUT_BATCH, B)
         z_roll_target = z_target[:n_rollout]
@@ -617,6 +850,48 @@ def flow_matching_loss(
 
         if ROLLOUT_DIVERSITY_LOSS_WEIGHT > 0:
             rollout_diversity_loss = pairwise_distance_match_loss(z_roll, z_roll_target, roll_mask)
+
+        need_entropy_logits = (
+            decoder is not None
+            and z_prompt is not None
+            and (
+                (ROLLOUT_ENTROPY_LOSS_WEIGHT > 0 and rollout_entropy_mult > 0)
+                or (ROLLOUT_GATED_GEN_CE_WEIGHT > 0 and suffix_ids is not None)
+                or (ROLLOUT_TARGET_PROB_WEIGHT > 0 and suffix_ids is not None)
+            )
+        )
+        if need_entropy_logits:
+            entropy_decoder = teacher_decoder if teacher_decoder is not None else decoder
+            z_entropy_gen_seq = torch.cat([z_prompt[:n_rollout], z_roll], dim=1)
+            z_entropy_real_seq = torch.cat([z_prompt[:n_rollout], z_roll_target], dim=1)
+            gen_entropy_logits = entropy_decoder.decode_from_latent(z_entropy_gen_seq)
+            with torch.no_grad():
+                oracle_entropy_logits = entropy_decoder.decode_from_latent(z_entropy_real_seq)
+            if ROLLOUT_ENTROPY_LOSS_WEIGHT > 0 and rollout_entropy_mult > 0:
+                rollout_entropy_loss, rollout_gen_entropy, rollout_oracle_entropy = entropy_gap_loss(
+                    gen_entropy_logits,
+                    oracle_entropy_logits,
+                    roll_mask,
+                )
+            if ROLLOUT_GATED_GEN_CE_WEIGHT > 0 and suffix_ids is not None:
+                rollout_gated_gen_ce, rollout_gated_gen_ce_active, rollout_gated_gen_ce_top1 = gated_generated_ce_loss(
+                    gen_entropy_logits,
+                    oracle_entropy_logits,
+                    suffix_ids[:n_rollout],
+                    roll_mask,
+                )
+            if ROLLOUT_TARGET_PROB_WEIGHT > 0 and suffix_ids is not None:
+                (
+                    rollout_target_prob_loss,
+                    rollout_target_prob_active,
+                    rollout_target_prob_gen,
+                    rollout_target_prob_oracle,
+                ) = target_probability_loss(
+                    gen_entropy_logits,
+                    oracle_entropy_logits,
+                    suffix_ids[:n_rollout],
+                    roll_mask,
+                )
 
         if (
             decoder is not None
@@ -703,6 +978,13 @@ def flow_matching_loss(
                     suffix_targets,
                     ignore_index=0,
                 )
+            else:
+                gen_logits = None
+
+            if ROLLOUT_LOGIT_BALANCE_WEIGHT > 0:
+                if gen_logits is None:
+                    gen_logits = decoder.decode_from_latent(z_gen_seq)
+                rollout_logit_balance, rollout_logit_topmass = logit_balance_loss(gen_logits, roll_mask)
 
             if DECODER_ADAPT_PRESERVE_KL_WEIGHT > 0 and teacher_decoder is not None:
                 if real_logits is None:
@@ -731,10 +1013,14 @@ def flow_matching_loss(
         + ROLLOUT_DECODE_LOSS_WEIGHT * rollout_decode_loss
         + ROLLOUT_HIDDEN_LOSS_WEIGHT * rollout_hidden_loss
         + ROLLOUT_LOGIT_KL_WEIGHT * rollout_logit_kl
+        + (ROLLOUT_ENTROPY_LOSS_WEIGHT * rollout_entropy_mult) * rollout_entropy_loss
+        + ROLLOUT_GATED_GEN_CE_WEIGHT * rollout_gated_gen_ce
+        + ROLLOUT_TARGET_PROB_WEIGHT * rollout_target_prob_loss
+        + ROLLOUT_LOGIT_BALANCE_WEIGHT * rollout_logit_balance
         + ROLLOUT_NORM_LOSS_WEIGHT * rollout_norm_loss
         + ROLLOUT_DIVERSITY_LOSS_WEIGHT * rollout_diversity_loss
         + DECODER_ADAPT_REAL_CE_WEIGHT * decoder_adapt_real_ce
-        + DECODER_ADAPT_GEN_CE_WEIGHT * decoder_adapt_gen_ce
+        + (DECODER_ADAPT_GEN_CE_WEIGHT * decoder_adapt_gen_ce_mult) * decoder_adapt_gen_ce
         + DECODER_ADAPT_PRESERVE_KL_WEIGHT * decoder_adapt_preserve_kl
         + metric_reg
         + gate_reg
@@ -760,13 +1046,31 @@ def flow_matching_loss(
             "weighted_rollout_hidden_loss": (ROLLOUT_HIDDEN_LOSS_WEIGHT * rollout_hidden_loss).detach().item(),
             "rollout_logit_kl": rollout_logit_kl.detach().item(),
             "weighted_rollout_logit_kl": (ROLLOUT_LOGIT_KL_WEIGHT * rollout_logit_kl).detach().item(),
+            "rollout_entropy_loss": rollout_entropy_loss.detach().item(),
+            "weighted_rollout_entropy_loss": ((ROLLOUT_ENTROPY_LOSS_WEIGHT * rollout_entropy_mult) * rollout_entropy_loss).detach().item(),
+            "rollout_entropy_mult": float(rollout_entropy_mult),
+            "rollout_gen_entropy": rollout_gen_entropy,
+            "rollout_oracle_entropy": rollout_oracle_entropy,
+            "rollout_gated_gen_ce": rollout_gated_gen_ce.detach().item(),
+            "weighted_rollout_gated_gen_ce": (ROLLOUT_GATED_GEN_CE_WEIGHT * rollout_gated_gen_ce).detach().item(),
+            "rollout_gated_gen_ce_active": rollout_gated_gen_ce_active,
+            "rollout_gated_gen_ce_top1": rollout_gated_gen_ce_top1,
+            "rollout_target_prob_loss": rollout_target_prob_loss.detach().item(),
+            "weighted_rollout_target_prob_loss": (ROLLOUT_TARGET_PROB_WEIGHT * rollout_target_prob_loss).detach().item(),
+            "rollout_target_prob_active": rollout_target_prob_active,
+            "rollout_target_prob_gen": rollout_target_prob_gen,
+            "rollout_target_prob_oracle": rollout_target_prob_oracle,
+            "rollout_logit_balance": rollout_logit_balance.detach().item(),
+            "weighted_rollout_logit_balance": (ROLLOUT_LOGIT_BALANCE_WEIGHT * rollout_logit_balance).detach().item(),
+            "rollout_logit_topmass": rollout_logit_topmass,
             "rollout_norm_loss": rollout_norm_loss.detach().item(),
             "rollout_diversity_loss": rollout_diversity_loss.detach().item(),
             "weighted_rollout_diversity_loss": (ROLLOUT_DIVERSITY_LOSS_WEIGHT * rollout_diversity_loss).detach().item(),
             "decoder_adapt_real_ce": decoder_adapt_real_ce.detach().item(),
             "weighted_decoder_adapt_real_ce": (DECODER_ADAPT_REAL_CE_WEIGHT * decoder_adapt_real_ce).detach().item(),
             "decoder_adapt_gen_ce": decoder_adapt_gen_ce.detach().item(),
-            "weighted_decoder_adapt_gen_ce": (DECODER_ADAPT_GEN_CE_WEIGHT * decoder_adapt_gen_ce).detach().item(),
+            "decoder_adapt_gen_ce_mult": float(decoder_adapt_gen_ce_mult),
+            "weighted_decoder_adapt_gen_ce": ((DECODER_ADAPT_GEN_CE_WEIGHT * decoder_adapt_gen_ce_mult) * decoder_adapt_gen_ce).detach().item(),
             "decoder_adapt_preserve_kl": decoder_adapt_preserve_kl.detach().item(),
             "weighted_decoder_adapt_preserve_kl": (DECODER_ADAPT_PRESERVE_KL_WEIGHT * decoder_adapt_preserve_kl).detach().item(),
             "self_gate": self_gate,
@@ -868,6 +1172,85 @@ def argmax_token_collapse_stats(logits, token_ids, tokenizer):
         "unique_ratio": sum(unique_ratios) / max(len(unique_ratios), 1),
         "max_frac": sum(max_fracs) / max(len(max_fracs), 1),
         "top_tokens": top_tokens,
+    }
+
+
+def decoder_distribution_stats(logits, tokenizer, mask=None, oracle_logits=None, target_ids=None):
+    suffix_logits = logits[:, PROMPT_LEN:, :].float()
+    probs = suffix_logits.softmax(dim=-1)
+    top1_acc = 0.0
+    target_prob_mean = 0.0
+    oracle_top1_acc = 0.0
+    oracle_target_prob_mean = 0.0
+
+    if target_ids is not None:
+        suffix_targets = target_ids[:, PROMPT_LEN:] if target_ids.size(1) == logits.size(1) else target_ids
+        target_valid = suffix_targets != 0
+        if mask is not None:
+            target_valid = target_valid & mask.bool()
+        if target_valid.any():
+            target_gather_ids = suffix_targets.clamp(0, probs.size(-1) - 1).unsqueeze(-1)
+            target_probs = probs.gather(dim=-1, index=target_gather_ids).squeeze(-1)
+            top_ids = probs.argmax(dim=-1)
+            top1_acc = (top_ids[target_valid] == suffix_targets[target_valid]).float().mean().item()
+            target_prob_mean = target_probs[target_valid].mean().item()
+
+            if oracle_logits is not None:
+                oracle_probs_full = oracle_logits[:, PROMPT_LEN:, :].float().softmax(dim=-1)
+                oracle_target_probs = oracle_probs_full.gather(dim=-1, index=target_gather_ids).squeeze(-1)
+                oracle_top_ids = oracle_probs_full.argmax(dim=-1)
+                oracle_top1_acc = (
+                    oracle_top_ids[target_valid] == suffix_targets[target_valid]
+                ).float().mean().item()
+                oracle_target_prob_mean = oracle_target_probs[target_valid].mean().item()
+
+    if mask is not None:
+        valid = mask.bool()
+        if valid.any():
+            probs = probs[valid]
+            suffix_logits = suffix_logits[valid]
+            if oracle_logits is not None:
+                oracle_suffix_logits = oracle_logits[:, PROMPT_LEN:, :].float()[valid]
+        else:
+            probs = probs.reshape(-1, probs.size(-1))
+            suffix_logits = suffix_logits.reshape(-1, suffix_logits.size(-1))
+            oracle_suffix_logits = None
+    else:
+        probs = probs.reshape(-1, probs.size(-1))
+        suffix_logits = suffix_logits.reshape(-1, suffix_logits.size(-1))
+        oracle_suffix_logits = (
+            oracle_logits[:, PROMPT_LEN:, :].float().reshape(-1, oracle_logits.size(-1))
+            if oracle_logits is not None
+            else None
+        )
+
+    special_ids = torch.tensor(tokenizer.all_special_ids, device=probs.device)
+    entropy = -(probs * probs.clamp_min(1e-9).log()).sum(dim=-1)
+    top_probs, _ = probs.topk(min(50, probs.size(-1)), dim=-1)
+    mean_probs = probs.clone()
+    mean_probs[:, special_ids] = 0.0
+    mean_probs = mean_probs.mean(dim=0)
+    batch_top_mass = mean_probs.topk(min(8, mean_probs.numel())).values.sum()
+    special_mass = probs[:, special_ids].sum(dim=-1)
+
+    kl_to_oracle = None
+    if oracle_logits is not None and oracle_suffix_logits is not None:
+        oracle_log_probs = F.log_softmax(oracle_suffix_logits, dim=-1)
+        gen_log_probs = F.log_softmax(suffix_logits, dim=-1)
+        kl_to_oracle = F.kl_div(gen_log_probs, oracle_log_probs.exp(), reduction="batchmean").item()
+
+    return {
+        "entropy": entropy.mean().item(),
+        "top1_prob": top_probs[:, 0].mean().item(),
+        "top5_mass": top_probs[:, :min(5, top_probs.size(1))].sum(dim=-1).mean().item(),
+        "top50_mass": top_probs.sum(dim=-1).mean().item(),
+        "batch_top8_mass": batch_top_mass.item(),
+        "special_mass": special_mass.mean().item(),
+        "kl_to_oracle": kl_to_oracle,
+        "top1_acc": top1_acc,
+        "target_prob": target_prob_mean,
+        "oracle_top1_acc": oracle_top1_acc,
+        "oracle_target_prob": oracle_target_prob_mean,
     }
 
 
@@ -983,26 +1366,52 @@ def evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, devi
             logits = decoder.decode_from_latent(z_gen_seq)
             oracle_logits = decoder.decode_from_latent(z_real[sample_idx])
         pred_ids = logits.argmax(-1)
+        sampled_ids = sample_token_ids(logits, tokenizer)
         oracle_ids = oracle_logits.argmax(-1)
         gen_collapse = argmax_token_collapse_stats(logits, pred_ids, tokenizer)
+        sampled_collapse = argmax_token_collapse_stats(logits, sampled_ids, tokenizer)
         oracle_collapse = argmax_token_collapse_stats(oracle_logits, oracle_ids, tokenizer)
+        sample_suffix_mask = attn_mask[sample_idx, PROMPT_LEN:]
+        sample_target_ids = input_ids[sample_idx]
+        gen_dist = decoder_distribution_stats(
+            logits,
+            tokenizer,
+            sample_suffix_mask,
+            oracle_logits=oracle_logits,
+            target_ids=sample_target_ids,
+        )
+        oracle_dist = decoder_distribution_stats(
+            oracle_logits,
+            tokenizer,
+            sample_suffix_mask,
+            target_ids=sample_target_ids,
+        )
         print("\n-- riemannian samples -----------------------------------------")
         for sample_pos, batch_idx in enumerate(sample_idx.tolist()):
             prompt = tokenizer.decode(input_ids[batch_idx, :PROMPT_LEN], skip_special_tokens=True)
             target = tokenizer.decode(input_ids[batch_idx, PROMPT_LEN:], skip_special_tokens=True)
-            generated = tokenizer.decode(pred_ids[sample_pos, PROMPT_LEN:], skip_special_tokens=True)
+            sampled = tokenizer.decode(sampled_ids[sample_pos, PROMPT_LEN:], skip_special_tokens=True)
+            argmax = tokenizer.decode(pred_ids[sample_pos, PROMPT_LEN:], skip_special_tokens=True)
             oracle = tokenizer.decode(oracle_ids[sample_pos, PROMPT_LEN:], skip_special_tokens=True)
             print(f"  prompt:     {prompt}")
             print(f"  target:     {target[:120]}")
             print(f"  oracle:     {oracle[:120]}")
-            print(f"  generated:  {generated[:120]}")
+            print(f"  generated:  {sampled[:120]}")
+            print(f"  argmax:     {argmax[:120]}")
             print()
         print(
-            "  collapse gen   : "
+            "  collapse argmax: "
             f"entropy={gen_collapse['entropy']:.2f} "
             f"uniq={gen_collapse['unique_ratio']:.3f} "
             f"maxfrac={gen_collapse['max_frac']:.3f} "
             f"top={', '.join(gen_collapse['top_tokens'])}"
+        )
+        print(
+            "  collapse gen   : "
+            f"entropy={sampled_collapse['entropy']:.2f} "
+            f"uniq={sampled_collapse['unique_ratio']:.3f} "
+            f"maxfrac={sampled_collapse['max_frac']:.3f} "
+            f"top={', '.join(sampled_collapse['top_tokens'])}"
         )
         print(
             "  collapse oracle: "
@@ -1010,6 +1419,34 @@ def evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, devi
             f"uniq={oracle_collapse['unique_ratio']:.3f} "
             f"maxfrac={oracle_collapse['max_frac']:.3f} "
             f"top={', '.join(oracle_collapse['top_tokens'])}"
+        )
+        print(
+            "  dist gen      : "
+            f"ent={gen_dist['entropy']:.2f} "
+            f"top1={gen_dist['top1_prob']:.3f} "
+            f"top5={gen_dist['top5_mass']:.3f} "
+            f"top50={gen_dist['top50_mass']:.3f} "
+            f"batch_top8={gen_dist['batch_top8_mass']:.3f} "
+            f"special={gen_dist['special_mass']:.3f} "
+            f"oracle_to_gen_kl={gen_dist['kl_to_oracle']:.3f}"
+        )
+        print(
+            "  target gen    : "
+            f"top1_acc={gen_dist['top1_acc']:.3f} "
+            f"target_prob={gen_dist['target_prob']:.4f} "
+            f"oracle_top1_acc={gen_dist['oracle_top1_acc']:.3f} "
+            f"oracle_target_prob={gen_dist['oracle_target_prob']:.4f}"
+        )
+        print(
+            "  dist oracle   : "
+            f"ent={oracle_dist['entropy']:.2f} "
+            f"top1={oracle_dist['top1_prob']:.3f} "
+            f"top5={oracle_dist['top5_mass']:.3f} "
+            f"top50={oracle_dist['top50_mass']:.3f} "
+            f"batch_top8={oracle_dist['batch_top8_mass']:.3f} "
+            f"special={oracle_dist['special_mass']:.3f} "
+            f"target_prob={oracle_dist['target_prob']:.4f} "
+            f"top1_acc={oracle_dist['top1_acc']:.3f}"
         )
         print()
 
@@ -1182,6 +1619,7 @@ for epoch in range(EPOCHS):
                 teacher_decoder=teacher_decoder,
                 return_stats=True,
                 global_step=epoch * len(train_loader) + step,
+                steps_per_epoch=len(train_loader),
             )
 
         optimizer.zero_grad()
@@ -1207,11 +1645,23 @@ for epoch in range(EPOCHS):
                 f" | rollout {stats['rollout_loss']:.4f}"
                 f" | rdloss {stats['rollout_decode_loss']:.4f}*{ROLLOUT_DECODE_LOSS_WEIGHT:.3f}={stats['weighted_rollout_decode_loss']:.4f}"
                 f" | rhid {stats['rollout_hidden_loss']:.4f}*{ROLLOUT_HIDDEN_LOSS_WEIGHT:.3f}={stats['weighted_rollout_hidden_loss']:.4f}"
-                f" | rkl {stats['rollout_logit_kl']:.4f}*{ROLLOUT_LOGIT_KL_WEIGHT:.3f}={stats['weighted_rollout_logit_kl']:.4f}"
+                f" | oracle2gen_kl {stats['rollout_logit_kl']:.4f}*{ROLLOUT_LOGIT_KL_WEIGHT:.3f}={stats['weighted_rollout_logit_kl']:.4f}"
+                f" | entgap {stats['rollout_entropy_loss']:.4f}*{ROLLOUT_ENTROPY_LOSS_WEIGHT:.3f}={stats['weighted_rollout_entropy_loss']:.4f}"
+                f" ent g/o={stats['rollout_gen_entropy']:.2f}/{stats['rollout_oracle_entropy']:.2f}"
+                f" ent_mult={stats['rollout_entropy_mult']:.2f}"
+                f" | rgce {stats['rollout_gated_gen_ce']:.4f}*{ROLLOUT_GATED_GEN_CE_WEIGHT:.3f}={stats['weighted_rollout_gated_gen_ce']:.4f}"
+                f" act={stats['rollout_gated_gen_ce_active']:.2f}"
+                f" top1={stats['rollout_gated_gen_ce_top1']:.3f}"
+                f" | rtp {stats['rollout_target_prob_loss']:.4f}*{ROLLOUT_TARGET_PROB_WEIGHT:.3f}={stats['weighted_rollout_target_prob_loss']:.4f}"
+                f" act={stats['rollout_target_prob_active']:.2f}"
+                f" p={stats['rollout_target_prob_gen']:.3f}/{stats['rollout_target_prob_oracle']:.3f}"
+                f" | rbal {stats['rollout_logit_balance']:.4f}*{ROLLOUT_LOGIT_BALANCE_WEIGHT:.3f}={stats['weighted_rollout_logit_balance']:.4f}"
+                f" topm={stats['rollout_logit_topmass']:.3f}"
                 f" | rnloss {stats['rollout_norm_loss']:.4f}"
                 f" | rdiv {stats['rollout_diversity_loss']:.4f}*{ROLLOUT_DIVERSITY_LOSS_WEIGHT:.3f}={stats['weighted_rollout_diversity_loss']:.4f}"
                 f" | dace {stats['decoder_adapt_real_ce']:.4f}*{DECODER_ADAPT_REAL_CE_WEIGHT:.3f}={stats['weighted_decoder_adapt_real_ce']:.4f}"
-                f" | dagce {stats['decoder_adapt_gen_ce']:.4f}*{DECODER_ADAPT_GEN_CE_WEIGHT:.3f}={stats['weighted_decoder_adapt_gen_ce']:.4f}"
+                f" | dagce {stats['decoder_adapt_gen_ce']:.4f}*{DECODER_ADAPT_GEN_CE_WEIGHT:.3f}"
+                f"x{stats['decoder_adapt_gen_ce_mult']:.2f}={stats['weighted_decoder_adapt_gen_ce']:.4f}"
                 f" | dakl {stats['decoder_adapt_preserve_kl']:.4f}*{DECODER_ADAPT_PRESERVE_KL_WEIGHT:.3f}={stats['weighted_decoder_adapt_preserve_kl']:.4f}"
                 f" | metric {stats['metric_mean']:.3f}+/-{stats['metric_std']:.3f}"
                 f" [{stats['metric_min']:.3f},{stats['metric_max']:.3f}]"
@@ -1247,6 +1697,26 @@ for epoch in range(EPOCHS):
             "rollout_hidden_loss_weight": ROLLOUT_HIDDEN_LOSS_WEIGHT,
             "rollout_logit_kl_weight": ROLLOUT_LOGIT_KL_WEIGHT,
             "rollout_logit_kl_temp": ROLLOUT_LOGIT_KL_TEMP,
+            "rollout_logit_kl_direction": "oracle_to_gen",
+            "rollout_entropy_loss_weight": ROLLOUT_ENTROPY_LOSS_WEIGHT,
+            "rollout_entropy_margin": ROLLOUT_ENTROPY_MARGIN,
+            "rollout_entropy_full_epochs": ROLLOUT_ENTROPY_FULL_EPOCHS,
+            "rollout_entropy_decay_epochs": ROLLOUT_ENTROPY_DECAY_EPOCHS,
+            "rollout_entropy_loss_target": "one_sided_oracle_entropy",
+            "rollout_entropy_loss_decoder": "teacher_decoder" if DECODER_ADAPT else "decoder",
+            "rollout_entropy_gen_latents": "raw_rollout",
+            "rollout_gated_gen_ce_weight": ROLLOUT_GATED_GEN_CE_WEIGHT,
+            "rollout_gated_gen_ce_top1_cap": ROLLOUT_GATED_GEN_CE_TOP1_CAP,
+            "rollout_gated_gen_ce_entropy_margin": ROLLOUT_GATED_GEN_CE_ENTROPY_MARGIN,
+            "rollout_gated_gen_ce_decoder": "teacher_decoder" if DECODER_ADAPT else "decoder",
+            "rollout_target_prob_weight": ROLLOUT_TARGET_PROB_WEIGHT,
+            "rollout_target_prob_margin": ROLLOUT_TARGET_PROB_MARGIN,
+            "rollout_target_prob_top1_cap": ROLLOUT_TARGET_PROB_TOP1_CAP,
+            "rollout_target_prob_decoder": "teacher_decoder" if DECODER_ADAPT else "decoder",
+            "rollout_logit_balance_weight": ROLLOUT_LOGIT_BALANCE_WEIGHT,
+            "rollout_logit_balance_topk": ROLLOUT_LOGIT_BALANCE_TOPK,
+            "rollout_logit_balance_target": ROLLOUT_LOGIT_BALANCE_TARGET,
+            "logit_balance_special_ids": LOGIT_BALANCE_SPECIAL_IDS,
             "rollout_norm_loss_weight": ROLLOUT_NORM_LOSS_WEIGHT,
             "rollout_diversity_loss_weight": ROLLOUT_DIVERSITY_LOSS_WEIGHT,
             "rollout_diversity_max_tokens": ROLLOUT_DIVERSITY_MAX_TOKENS,
@@ -1261,6 +1731,7 @@ for epoch in range(EPOCHS):
             "decoder_adapt_lr": DECODER_ADAPT_LR,
             "decoder_adapt_real_ce_weight": DECODER_ADAPT_REAL_CE_WEIGHT,
             "decoder_adapt_gen_ce_weight": DECODER_ADAPT_GEN_CE_WEIGHT,
+            "decoder_adapt_gen_ce_ramp_epochs": DECODER_ADAPT_GEN_CE_RAMP_EPOCHS,
             "decoder_adapt_preserve_kl_weight": DECODER_ADAPT_PRESERVE_KL_WEIGHT,
             "decoder_adapt_kl_temp": DECODER_ADAPT_KL_TEMP,
             "decoder_adapt_modules": DECODER_ADAPT_MODULES,
@@ -1284,6 +1755,9 @@ for epoch in range(EPOCHS):
             "flow_out_init": "zero",
             "metric_hidden_dim": METRIC_HIDDEN_DIM,
             "ode_steps": ODE_STEPS,
+            "eval_sample_temperature": EVAL_SAMPLE_TEMPERATURE,
+            "eval_sample_top_k": EVAL_SAMPLE_TOP_K,
+            "eval_sample_top_p": EVAL_SAMPLE_TOP_P,
             "train_size": TRAIN_SIZE,
             "seed": SEED,
             "dataloader_num_workers": DATALOADER_NUM_WORKERS,

@@ -1,3 +1,5 @@
+import argparse
+import hashlib
 import os
 import sys
 
@@ -15,7 +17,7 @@ BASE_NOISE_STD = 0.30
 CALIBRATE_GENERATED_LATENTS = True
 TARGET_LATENT_MEAN = -0.003
 TARGET_LATENT_STD = 0.264
-DECODE_TEMPERATURE = 0.9
+DECODE_TEMPERATURE = 0.8
 DECODE_TOP_K = 50
 DECODE_TOP_P = 0.95
 FLOW_HIDDEN_DIM = 512
@@ -26,6 +28,65 @@ ODE_STEPS = 16
 SELF_GATE_SCALE = 0.10
 CROSS_GATE_SCALE = 0.10
 GATE_INIT = 0.20
+
+
+def checkpoint_file_info(path):
+    abs_path = os.path.abspath(path)
+    stat = os.stat(abs_path)
+    return abs_path, stat.st_size, stat.st_mtime
+
+
+def tensor_state_fingerprint(state_dict, max_tensors=8):
+    digest = hashlib.sha256()
+    for idx, key in enumerate(sorted(state_dict.keys())):
+        if idx >= max_tensors:
+            break
+        tensor = state_dict[key].detach().cpu().contiguous()
+        digest.update(key.encode("utf-8"))
+        digest.update(str(tuple(tensor.shape)).encode("utf-8"))
+        digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()[:16]
+
+
+def checkpoint_fingerprint(ckpt):
+    parts = []
+    if "flow_net" in ckpt:
+        parts.append(f"flow={tensor_state_fingerprint(ckpt['flow_net'])}")
+    if "metric_net" in ckpt:
+        parts.append(f"metric={tensor_state_fingerprint(ckpt['metric_net'])}")
+    if "decoder" in ckpt:
+        parts.append(f"decoder={tensor_state_fingerprint(ckpt['decoder'])}")
+    return " ".join(parts) if parts else "no known model states"
+
+
+def print_checkpoint_summary(label, path, ckpt):
+    abs_path, size_bytes, mtime = checkpoint_file_info(path)
+    print(
+        f"{label} checkpoint: {abs_path} "
+        f"| size={size_bytes / (1024 * 1024):.1f}MB "
+        f"| mtime={mtime:.0f}",
+        flush=True,
+    )
+    print(f"{label} fingerprint: {checkpoint_fingerprint(ckpt)}", flush=True)
+    if label == "stage2":
+        metadata_keys = (
+            "stage2_arch",
+            "best_score",
+            "best_loss",
+            "train_size",
+            "seed",
+            "flow_hidden_dim",
+            "flow_depth",
+            "metric_hidden_dim",
+            "metric_log_bound",
+            "decoder_adapt",
+            "eval_sample_temperature",
+            "eval_sample_top_k",
+            "eval_sample_top_p",
+        )
+        metadata = {key: ckpt[key] for key in metadata_keys if key in ckpt}
+        if metadata:
+            print(f"stage2 metadata: {metadata}", flush=True)
 
 
 class FlowNet(nn.Module):
@@ -243,11 +304,13 @@ def load_models(stage1_path="stage1_best.pt", stage2_path=None):
     decoder = ParallelDecoder(latent_dim=256).to(device)
 
     ckpt1 = torch.load(stage1_path, map_location=device, weights_only=False)
+    print_checkpoint_summary("stage1", stage1_path, ckpt1)
     decoder.load_state_dict(ckpt1["decoder"])
     if "encoder" in ckpt1:
         encoder.load_state_dict(ckpt1["encoder"])
 
     ckpt2 = torch.load(stage2_path, map_location=device, weights_only=False)
+    print_checkpoint_summary("stage2", stage2_path, ckpt2)
     flow_net = FlowNet(
         latent_dim=256,
         hidden_dim=ckpt2.get("flow_hidden_dim", FLOW_HIDDEN_DIM),
@@ -363,8 +426,13 @@ def diagnose(flow_net, metric_net, encoder, decoder, tokenizer, device, steps=OD
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Prompt-conditioned Riemannian stage2 inference")
+    parser.add_argument("--stage1", default="stage1_best.pt", help="path to the stage1 checkpoint")
+    parser.add_argument("--stage2", default=None, help="path to the stage2 checkpoint")
+    args = parser.parse_args()
+
     tokenizer = cached_from_pretrained(BertTokenizer)
-    encoder, decoder, flow_net, metric_net = load_models()
+    encoder, decoder, flow_net, metric_net = load_models(args.stage1, args.stage2)
 
     diagnose(flow_net, metric_net, encoder, decoder, tokenizer, device)
 
