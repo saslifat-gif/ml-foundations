@@ -252,9 +252,6 @@ for epoch in range(EPOCHS):
                 f" | x0 {stats['x0_loss']:.4f}"
                 f" | dloss {stats['decode_loss']:.4f}*{DECODE_LOSS_WEIGHT:.3f}={stats['weighted_decode_loss']:.4f}"
                 f" | rollout {stats['rollout_loss']:.4f}"
-                f" | rdloss {stats['rollout_decode_loss']:.4f}*{ROLLOUT_DECODE_LOSS_WEIGHT:.3f}={stats['weighted_rollout_decode_loss']:.4f}"
-                f" | rhid {stats['rollout_hidden_loss']:.4f}*{ROLLOUT_HIDDEN_LOSS_WEIGHT:.3f}={stats['weighted_rollout_hidden_loss']:.4f}"
-                f" | oracle2gen_kl {stats['rollout_logit_kl']:.4f}*{ROLLOUT_LOGIT_KL_WEIGHT:.3f}={stats['weighted_rollout_logit_kl']:.4f}"
                 f" | entgap {stats['rollout_entropy_loss']:.4f}*{ROLLOUT_ENTROPY_LOSS_WEIGHT:.3f}={stats['weighted_rollout_entropy_loss']:.4f}"
                 f" ent g/o={stats['rollout_gen_entropy']:.2f}/{stats['rollout_oracle_entropy']:.2f}"
                 f" ent_mult={stats['rollout_entropy_mult']:.2f}"
@@ -264,8 +261,6 @@ for epoch in range(EPOCHS):
                 f" | rtp {stats['rollout_target_prob_loss']:.4f}*{ROLLOUT_TARGET_PROB_WEIGHT:.3f}={stats['weighted_rollout_target_prob_loss']:.4f}"
                 f" act={stats['rollout_target_prob_active']:.2f}"
                 f" p={stats['rollout_target_prob_gen']:.3f}/{stats['rollout_target_prob_oracle']:.3f}"
-                f" | rbal {stats['rollout_logit_balance']:.4f}*{ROLLOUT_LOGIT_BALANCE_WEIGHT:.3f}={stats['weighted_rollout_logit_balance']:.4f}"
-                f" topm={stats['rollout_logit_topmass']:.3f}"
                 f" | rnloss {stats['rollout_norm_loss']:.4f}"
                 f" | rdiv {stats['rollout_diversity_loss']:.4f}*{ROLLOUT_DIVERSITY_LOSS_WEIGHT:.3f}={stats['weighted_rollout_diversity_loss']:.4f}"
                 f" | dace {stats['decoder_adapt_real_ce']:.4f}*{DECODER_ADAPT_REAL_CE_WEIGHT:.3f}={stats['weighted_decoder_adapt_real_ce']:.4f}"
@@ -302,11 +297,6 @@ for epoch in range(EPOCHS):
             "decode_loss_weight": DECODE_LOSS_WEIGHT,
             "decode_loss_batch": DECODE_LOSS_BATCH,
             "rollout_loss_weight": ROLLOUT_LOSS_WEIGHT,
-            "rollout_decode_loss_weight": ROLLOUT_DECODE_LOSS_WEIGHT,
-            "rollout_hidden_loss_weight": ROLLOUT_HIDDEN_LOSS_WEIGHT,
-            "rollout_logit_kl_weight": ROLLOUT_LOGIT_KL_WEIGHT,
-            "rollout_logit_kl_temp": ROLLOUT_LOGIT_KL_TEMP,
-            "rollout_logit_kl_direction": "oracle_to_gen",
             "rollout_entropy_loss_weight": ROLLOUT_ENTROPY_LOSS_WEIGHT,
             "rollout_entropy_margin": ROLLOUT_ENTROPY_MARGIN,
             "rollout_entropy_full_epochs": ROLLOUT_ENTROPY_FULL_EPOCHS,
@@ -322,10 +312,6 @@ for epoch in range(EPOCHS):
             "rollout_target_prob_margin": ROLLOUT_TARGET_PROB_MARGIN,
             "rollout_target_prob_top1_cap": ROLLOUT_TARGET_PROB_TOP1_CAP,
             "rollout_target_prob_decoder": "teacher_decoder" if DECODER_ADAPT else "decoder",
-            "rollout_logit_balance_weight": ROLLOUT_LOGIT_BALANCE_WEIGHT,
-            "rollout_logit_balance_topk": ROLLOUT_LOGIT_BALANCE_TOPK,
-            "rollout_logit_balance_target": ROLLOUT_LOGIT_BALANCE_TARGET,
-            "logit_balance_special_ids": LOGIT_BALANCE_SPECIAL_IDS,
             "rollout_norm_loss_weight": ROLLOUT_NORM_LOSS_WEIGHT,
             "rollout_diversity_loss_weight": ROLLOUT_DIVERSITY_LOSS_WEIGHT,
             "rollout_diversity_max_tokens": ROLLOUT_DIVERSITY_MAX_TOKENS,

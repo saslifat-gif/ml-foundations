@@ -34,12 +34,6 @@ def flatten_valid(z_target, z_t, v_true, v_pred, z_x0, z_cond, pos, t, target_ma
     return z_target, z_t, v_true, v_pred, z_x0, cond_flat, pos, t
 
 
-def decoder_hidden_from_latent(decoder, z_latent):
-    x = decoder.project_up(z_latent)
-    out = decoder.bert(inputs_embeds=x)
-    return out.last_hidden_state
-
-
 def valid_token_latents(z, mask=None):
     if mask is None:
         return z.reshape(-1, z.size(-1))
@@ -62,29 +56,6 @@ def pairwise_distance_match_loss(z_pred, z_target, mask=None, max_tokens=ROLLOUT
     target_dist = torch.pdist(target_tokens.detach().float(), p=2)
     scale = target_dist.mean().clamp_min(eps)
     return F.smooth_l1_loss(pred_dist / scale, target_dist / scale)
-
-
-def logit_balance_loss(
-    logits,
-    mask=None,
-    topk=ROLLOUT_LOGIT_BALANCE_TOPK,
-    target=ROLLOUT_LOGIT_BALANCE_TARGET,
-):
-    suffix_logits = logits[:, PROMPT_LEN:, :].float()
-    probs = suffix_logits.softmax(dim=-1)
-    if mask is not None:
-        valid = mask.bool()
-        if not valid.any():
-            return logits.new_tensor(0.0), 0.0
-        probs = probs[valid]
-    else:
-        probs = probs.reshape(-1, probs.size(-1))
-    probs = probs.clone()
-    special_ids = torch.tensor(LOGIT_BALANCE_SPECIAL_IDS, device=probs.device)
-    probs[:, special_ids] = 0.0
-    mean_probs = probs.mean(dim=0)
-    top_mass = mean_probs.topk(min(topk, mean_probs.numel())).values.sum()
-    return (top_mass - target).clamp_min(0.0).pow(2), top_mass.detach().item()
 
 
 def entropy_weight_multiplier(global_step=None, steps_per_epoch=None):
@@ -245,12 +216,6 @@ def flow_matching_loss(
                     "metric_reg": 0.0,
                     "metric_reg_mult": 1.0,
                     "rollout_loss": 0.0,
-                    "rollout_decode_loss": 0.0,
-                    "weighted_rollout_decode_loss": 0.0,
-                    "rollout_hidden_loss": 0.0,
-                    "weighted_rollout_hidden_loss": 0.0,
-                    "rollout_logit_kl": 0.0,
-                    "weighted_rollout_logit_kl": 0.0,
                     "rollout_entropy_loss": 0.0,
                     "weighted_rollout_entropy_loss": 0.0,
                     "rollout_entropy_mult": 0.0,
@@ -265,9 +230,6 @@ def flow_matching_loss(
                     "rollout_target_prob_active": 0.0,
                     "rollout_target_prob_gen": 0.0,
                     "rollout_target_prob_oracle": 0.0,
-                    "rollout_logit_balance": 0.0,
-                    "weighted_rollout_logit_balance": 0.0,
-                    "rollout_logit_topmass": 0.0,
                     "rollout_norm_loss": 0.0,
                     "rollout_diversity_loss": 0.0,
                     "weighted_rollout_diversity_loss": 0.0,
@@ -335,9 +297,6 @@ def flow_matching_loss(
         decode_loss = F.cross_entropy(suffix_logits, suffix_targets, ignore_index=0)
 
     rollout_loss = z_target.new_tensor(0.0)
-    rollout_decode_loss = z_target.new_tensor(0.0)
-    rollout_hidden_loss = z_target.new_tensor(0.0)
-    rollout_logit_kl = z_target.new_tensor(0.0)
     rollout_entropy_loss = z_target.new_tensor(0.0)
     rollout_entropy_mult = entropy_weight_multiplier(global_step, steps_per_epoch)
     rollout_gen_entropy = 0.0
@@ -349,13 +308,12 @@ def flow_matching_loss(
     rollout_target_prob_active = 0.0
     rollout_target_prob_gen = 0.0
     rollout_target_prob_oracle = 0.0
-    rollout_logit_balance = z_target.new_tensor(0.0)
-    rollout_logit_topmass = 0.0
     rollout_norm_loss = z_target.new_tensor(0.0)
     rollout_diversity_loss = z_target.new_tensor(0.0)
     decoder_adapt_real_ce = z_target.new_tensor(0.0)
     decoder_adapt_gen_ce = z_target.new_tensor(0.0)
     decoder_adapt_preserve_kl = z_target.new_tensor(0.0)
+    teacher_real_logits = None
     decoder_adapt_gen_ce_mult = 1.0
     if DECODER_ADAPT_GEN_CE_RAMP_EPOCHS > 0 and global_step is not None and steps_per_epoch:
         ramp_steps = max(1, int(DECODER_ADAPT_GEN_CE_RAMP_EPOCHS * steps_per_epoch))
@@ -406,6 +364,8 @@ def flow_matching_loss(
             gen_entropy_logits = entropy_decoder.decode_from_latent(z_entropy_gen_seq)
             with torch.no_grad():
                 oracle_entropy_logits = entropy_decoder.decode_from_latent(z_entropy_real_seq)
+            if entropy_decoder is teacher_decoder:
+                teacher_real_logits = oracle_entropy_logits
             if ROLLOUT_ENTROPY_LOSS_WEIGHT > 0 and rollout_entropy_mult > 0:
                 rollout_entropy_loss, rollout_gen_entropy, rollout_oracle_entropy = entropy_gap_loss(
                     gen_entropy_logits,
@@ -432,69 +392,6 @@ def flow_matching_loss(
                     roll_mask,
                 )
 
-        if (
-            decoder is not None
-            and z_prompt is not None
-            and suffix_ids is not None
-            and (
-                ROLLOUT_DECODE_LOSS_WEIGHT > 0
-                or ROLLOUT_HIDDEN_LOSS_WEIGHT > 0
-                or ROLLOUT_LOGIT_KL_WEIGHT > 0
-            )
-        ):
-            z_roll_seq = torch.cat([z_prompt[:n_rollout], z_roll], dim=1)
-            roll_hidden = decoder_hidden_from_latent(decoder, z_roll_seq)
-            roll_logits = None
-
-            if ROLLOUT_DECODE_LOSS_WEIGHT > 0:
-                roll_logits = decoder.to_logits(roll_hidden)
-                roll_suffix_logits = roll_logits[:, PROMPT_LEN:, :].reshape(-1, roll_logits.size(-1))
-                roll_suffix_targets = suffix_ids[:n_rollout].reshape(-1)
-                rollout_decode_loss = F.cross_entropy(
-                    roll_suffix_logits,
-                    roll_suffix_targets,
-                    ignore_index=0,
-                )
-
-            if ROLLOUT_HIDDEN_LOSS_WEIGHT > 0 or ROLLOUT_LOGIT_KL_WEIGHT > 0:
-                z_real_seq = torch.cat([z_prompt[:n_rollout], z_roll_target], dim=1)
-                with torch.no_grad():
-                    real_hidden = decoder_hidden_from_latent(decoder, z_real_seq)
-
-            if ROLLOUT_HIDDEN_LOSS_WEIGHT > 0:
-                if roll_mask is not None:
-                    valid_hidden = roll_mask.bool()
-                    if valid_hidden.any():
-                        rollout_hidden_loss = F.mse_loss(
-                            roll_hidden[:, PROMPT_LEN:, :][valid_hidden],
-                            real_hidden[:, PROMPT_LEN:, :][valid_hidden],
-                        )
-                else:
-                    rollout_hidden_loss = F.mse_loss(
-                        roll_hidden[:, PROMPT_LEN:, :],
-                        real_hidden[:, PROMPT_LEN:, :],
-                    )
-
-            if ROLLOUT_LOGIT_KL_WEIGHT > 0:
-                if roll_logits is None:
-                    roll_logits = decoder.to_logits(roll_hidden)
-                with torch.no_grad():
-                    real_logits = decoder.to_logits(real_hidden)
-                roll_suffix_logits = roll_logits[:, PROMPT_LEN:, :].float()
-                real_suffix_logits = real_logits[:, PROMPT_LEN:, :].float()
-                temp = ROLLOUT_LOGIT_KL_TEMP
-                token_kl = F.kl_div(
-                    F.log_softmax(roll_suffix_logits / temp, dim=-1),
-                    F.softmax(real_suffix_logits / temp, dim=-1),
-                    reduction="none",
-                ).sum(dim=-1) * (temp * temp)
-                if roll_mask is not None:
-                    valid_kl = roll_mask.bool()
-                    if valid_kl.any():
-                        rollout_logit_kl = token_kl[valid_kl].mean()
-                else:
-                    rollout_logit_kl = token_kl.mean()
-
         if DECODER_ADAPT and decoder is not None and z_prompt is not None and suffix_ids is not None:
             z_real_seq = torch.cat([z_prompt[:n_rollout], z_roll_target], dim=1)
             z_gen_seq = torch.cat([z_prompt[:n_rollout], z_roll], dim=1)
@@ -520,20 +417,16 @@ def flow_matching_loss(
             else:
                 gen_logits = None
 
-            if ROLLOUT_LOGIT_BALANCE_WEIGHT > 0:
-                if gen_logits is None:
-                    gen_logits = decoder.decode_from_latent(z_gen_seq)
-                rollout_logit_balance, rollout_logit_topmass = logit_balance_loss(gen_logits, roll_mask)
-
             if DECODER_ADAPT_PRESERVE_KL_WEIGHT > 0 and teacher_decoder is not None:
                 if real_logits is None:
                     real_logits = decoder.decode_from_latent(z_real_seq)
-                with torch.no_grad():
-                    teacher_logits = teacher_decoder.decode_from_latent(z_real_seq)
+                if teacher_real_logits is None:
+                    with torch.no_grad():
+                        teacher_real_logits = teacher_decoder.decode_from_latent(z_real_seq)
                 temp = DECODER_ADAPT_KL_TEMP
                 token_kl = F.kl_div(
                     F.log_softmax(real_logits[:, PROMPT_LEN:, :].float() / temp, dim=-1),
-                    F.softmax(teacher_logits[:, PROMPT_LEN:, :].float() / temp, dim=-1),
+                    F.softmax(teacher_real_logits[:, PROMPT_LEN:, :].float() / temp, dim=-1),
                     reduction="none",
                 ).sum(dim=-1) * (temp * temp)
                 if roll_mask is not None:
@@ -549,13 +442,9 @@ def flow_matching_loss(
         + X0_LOSS_WEIGHT * x0_loss
         + DECODE_LOSS_WEIGHT * decode_loss
         + ROLLOUT_LOSS_WEIGHT * rollout_loss
-        + ROLLOUT_DECODE_LOSS_WEIGHT * rollout_decode_loss
-        + ROLLOUT_HIDDEN_LOSS_WEIGHT * rollout_hidden_loss
-        + ROLLOUT_LOGIT_KL_WEIGHT * rollout_logit_kl
         + (ROLLOUT_ENTROPY_LOSS_WEIGHT * rollout_entropy_mult) * rollout_entropy_loss
         + ROLLOUT_GATED_GEN_CE_WEIGHT * rollout_gated_gen_ce
         + ROLLOUT_TARGET_PROB_WEIGHT * rollout_target_prob_loss
-        + ROLLOUT_LOGIT_BALANCE_WEIGHT * rollout_logit_balance
         + ROLLOUT_NORM_LOSS_WEIGHT * rollout_norm_loss
         + ROLLOUT_DIVERSITY_LOSS_WEIGHT * rollout_diversity_loss
         + DECODER_ADAPT_REAL_CE_WEIGHT * decoder_adapt_real_ce
@@ -579,12 +468,6 @@ def flow_matching_loss(
             "metric_reg": metric_reg.detach().item(),
             "metric_reg_mult": float(metric_reg_mult),
             "rollout_loss": rollout_loss.detach().item(),
-            "rollout_decode_loss": rollout_decode_loss.detach().item(),
-            "weighted_rollout_decode_loss": (ROLLOUT_DECODE_LOSS_WEIGHT * rollout_decode_loss).detach().item(),
-            "rollout_hidden_loss": rollout_hidden_loss.detach().item(),
-            "weighted_rollout_hidden_loss": (ROLLOUT_HIDDEN_LOSS_WEIGHT * rollout_hidden_loss).detach().item(),
-            "rollout_logit_kl": rollout_logit_kl.detach().item(),
-            "weighted_rollout_logit_kl": (ROLLOUT_LOGIT_KL_WEIGHT * rollout_logit_kl).detach().item(),
             "rollout_entropy_loss": rollout_entropy_loss.detach().item(),
             "weighted_rollout_entropy_loss": ((ROLLOUT_ENTROPY_LOSS_WEIGHT * rollout_entropy_mult) * rollout_entropy_loss).detach().item(),
             "rollout_entropy_mult": float(rollout_entropy_mult),
@@ -599,9 +482,6 @@ def flow_matching_loss(
             "rollout_target_prob_active": rollout_target_prob_active,
             "rollout_target_prob_gen": rollout_target_prob_gen,
             "rollout_target_prob_oracle": rollout_target_prob_oracle,
-            "rollout_logit_balance": rollout_logit_balance.detach().item(),
-            "weighted_rollout_logit_balance": (ROLLOUT_LOGIT_BALANCE_WEIGHT * rollout_logit_balance).detach().item(),
-            "rollout_logit_topmass": rollout_logit_topmass,
             "rollout_norm_loss": rollout_norm_loss.detach().item(),
             "rollout_diversity_loss": rollout_diversity_loss.detach().item(),
             "weighted_rollout_diversity_loss": (ROLLOUT_DIVERSITY_LOSS_WEIGHT * rollout_diversity_loss).detach().item(),
