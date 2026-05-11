@@ -184,6 +184,32 @@ def target_probability_loss(
     )
 
 
+def rollout_flow_token_ce_loss(gen_logits, suffix_ids, mask=None):
+    suffix_logits = gen_logits[:, PROMPT_LEN:, :].float()
+    suffix_targets = suffix_ids[:gen_logits.size(0)]
+    valid = suffix_targets != 0
+    if mask is not None:
+        valid = valid & mask.bool()
+    if not valid.any():
+        return gen_logits.new_tensor(0.0), 0.0, 0.0
+
+    token_ce = F.cross_entropy(
+        suffix_logits.reshape(-1, suffix_logits.size(-1)),
+        suffix_targets.reshape(-1),
+        ignore_index=0,
+        reduction="none",
+    ).reshape(valid.shape)
+    probs = suffix_logits.softmax(dim=-1)
+    target_gather_ids = suffix_targets.clamp(0, probs.size(-1) - 1).unsqueeze(-1)
+    target_prob = probs.gather(dim=-1, index=target_gather_ids).squeeze(-1)
+    top1 = probs.max(dim=-1).values
+    return (
+        token_ce[valid].mean(),
+        target_prob[valid].detach().mean().item(),
+        top1[valid].detach().mean().item(),
+    )
+
+
 def flow_matching_loss(
     flow_net,
     metric_net,
@@ -225,6 +251,10 @@ def flow_matching_loss(
                     "weighted_rollout_gated_gen_ce": 0.0,
                     "rollout_gated_gen_ce_active": 0.0,
                     "rollout_gated_gen_ce_top1": 0.0,
+                    "rollout_flow_token_ce": 0.0,
+                    "weighted_rollout_flow_token_ce": 0.0,
+                    "rollout_flow_token_ce_target_prob": 0.0,
+                    "rollout_flow_token_ce_top1": 0.0,
                     "rollout_target_prob_loss": 0.0,
                     "weighted_rollout_target_prob_loss": 0.0,
                     "rollout_target_prob_active": 0.0,
@@ -304,6 +334,9 @@ def flow_matching_loss(
     rollout_gated_gen_ce = z_target.new_tensor(0.0)
     rollout_gated_gen_ce_active = 0.0
     rollout_gated_gen_ce_top1 = 0.0
+    rollout_flow_token_ce = z_target.new_tensor(0.0)
+    rollout_flow_token_ce_target_prob = 0.0
+    rollout_flow_token_ce_top1 = 0.0
     rollout_target_prob_loss = z_target.new_tensor(0.0)
     rollout_target_prob_active = 0.0
     rollout_target_prob_gen = 0.0
@@ -318,7 +351,20 @@ def flow_matching_loss(
     if DECODER_ADAPT_GEN_CE_RAMP_EPOCHS > 0 and global_step is not None and steps_per_epoch:
         ramp_steps = max(1, int(DECODER_ADAPT_GEN_CE_RAMP_EPOCHS * steps_per_epoch))
         decoder_adapt_gen_ce_mult = min(1.0, (global_step + 1) / ramp_steps)
-    if ROLLOUT_LOSS_WEIGHT > 0 and ROLLOUT_TRAIN_STEPS > 0:
+    need_rollout = (
+        ROLLOUT_TRAIN_STEPS > 0
+        and (
+            ROLLOUT_LOSS_WEIGHT > 0
+            or ROLLOUT_NORM_LOSS_WEIGHT > 0
+            or ROLLOUT_DIVERSITY_LOSS_WEIGHT > 0
+            or ROLLOUT_FLOW_TOKEN_CE_WEIGHT > 0
+            or ROLLOUT_GATED_GEN_CE_WEIGHT > 0
+            or ROLLOUT_TARGET_PROB_WEIGHT > 0
+            or (ROLLOUT_ENTROPY_LOSS_WEIGHT > 0 and rollout_entropy_mult > 0)
+            or DECODER_ADAPT
+        )
+    )
+    if need_rollout:
         n_rollout = min(ROLLOUT_BATCH, B)
         z_roll_target = z_target[:n_rollout]
         z_roll_cond = z_cond[:n_rollout]
@@ -354,6 +400,7 @@ def flow_matching_loss(
             and (
                 (ROLLOUT_ENTROPY_LOSS_WEIGHT > 0 and rollout_entropy_mult > 0)
                 or (ROLLOUT_GATED_GEN_CE_WEIGHT > 0 and suffix_ids is not None)
+                or (ROLLOUT_FLOW_TOKEN_CE_WEIGHT > 0 and suffix_ids is not None)
                 or (ROLLOUT_TARGET_PROB_WEIGHT > 0 and suffix_ids is not None)
             )
         )
@@ -378,6 +425,20 @@ def flow_matching_loss(
                     oracle_entropy_logits,
                     suffix_ids[:n_rollout],
                     roll_mask,
+                )
+            if ROLLOUT_FLOW_TOKEN_CE_WEIGHT > 0 and suffix_ids is not None:
+                n_flow_token_ce = n_rollout
+                if ROLLOUT_FLOW_TOKEN_CE_BATCH > 0:
+                    n_flow_token_ce = min(n_flow_token_ce, ROLLOUT_FLOW_TOKEN_CE_BATCH)
+                flow_token_mask = roll_mask[:n_flow_token_ce] if roll_mask is not None else None
+                (
+                    rollout_flow_token_ce,
+                    rollout_flow_token_ce_target_prob,
+                    rollout_flow_token_ce_top1,
+                ) = rollout_flow_token_ce_loss(
+                    gen_entropy_logits[:n_flow_token_ce],
+                    suffix_ids[:n_flow_token_ce],
+                    flow_token_mask,
                 )
             if ROLLOUT_TARGET_PROB_WEIGHT > 0 and suffix_ids is not None:
                 (
@@ -444,6 +505,7 @@ def flow_matching_loss(
         + ROLLOUT_LOSS_WEIGHT * rollout_loss
         + (ROLLOUT_ENTROPY_LOSS_WEIGHT * rollout_entropy_mult) * rollout_entropy_loss
         + ROLLOUT_GATED_GEN_CE_WEIGHT * rollout_gated_gen_ce
+        + ROLLOUT_FLOW_TOKEN_CE_WEIGHT * rollout_flow_token_ce
         + ROLLOUT_TARGET_PROB_WEIGHT * rollout_target_prob_loss
         + ROLLOUT_NORM_LOSS_WEIGHT * rollout_norm_loss
         + ROLLOUT_DIVERSITY_LOSS_WEIGHT * rollout_diversity_loss
@@ -477,6 +539,10 @@ def flow_matching_loss(
             "weighted_rollout_gated_gen_ce": (ROLLOUT_GATED_GEN_CE_WEIGHT * rollout_gated_gen_ce).detach().item(),
             "rollout_gated_gen_ce_active": rollout_gated_gen_ce_active,
             "rollout_gated_gen_ce_top1": rollout_gated_gen_ce_top1,
+            "rollout_flow_token_ce": rollout_flow_token_ce.detach().item(),
+            "weighted_rollout_flow_token_ce": (ROLLOUT_FLOW_TOKEN_CE_WEIGHT * rollout_flow_token_ce).detach().item(),
+            "rollout_flow_token_ce_target_prob": rollout_flow_token_ce_target_prob,
+            "rollout_flow_token_ce_top1": rollout_flow_token_ce_top1,
             "rollout_target_prob_loss": rollout_target_prob_loss.detach().item(),
             "weighted_rollout_target_prob_loss": (ROLLOUT_TARGET_PROB_WEIGHT * rollout_target_prob_loss).detach().item(),
             "rollout_target_prob_active": rollout_target_prob_active,

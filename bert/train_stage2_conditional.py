@@ -92,6 +92,7 @@ print(
     "stage2 config | "
     f"train_size={TRAIN_SIZE} batch={TRAIN_BATCH_SIZE} "
     f"flow={FLOW_HIDDEN_DIM}x{FLOW_DEPTH} metric={METRIC_HIDDEN_DIM} "
+    f"flow_token_ce={ROLLOUT_FLOW_TOKEN_CE_WEIGHT}x{ROLLOUT_FLOW_TOKEN_CE_BATCH} "
     f"compile={COMPILE_MODELS} fast_debug={FAST_DEBUG}",
     flush=True,
 )
@@ -258,6 +259,9 @@ for epoch in range(EPOCHS):
                 f" | rgce {stats['rollout_gated_gen_ce']:.4f}*{ROLLOUT_GATED_GEN_CE_WEIGHT:.3f}={stats['weighted_rollout_gated_gen_ce']:.4f}"
                 f" act={stats['rollout_gated_gen_ce_active']:.2f}"
                 f" top1={stats['rollout_gated_gen_ce_top1']:.3f}"
+                f" | rfce {stats['rollout_flow_token_ce']:.4f}*{ROLLOUT_FLOW_TOKEN_CE_WEIGHT:.3f}={stats['weighted_rollout_flow_token_ce']:.4f}"
+                f" p={stats['rollout_flow_token_ce_target_prob']:.3f}"
+                f" top1={stats['rollout_flow_token_ce_top1']:.3f}"
                 f" | rtp {stats['rollout_target_prob_loss']:.4f}*{ROLLOUT_TARGET_PROB_WEIGHT:.3f}={stats['weighted_rollout_target_prob_loss']:.4f}"
                 f" act={stats['rollout_target_prob_active']:.2f}"
                 f" p={stats['rollout_target_prob_gen']:.3f}/{stats['rollout_target_prob_oracle']:.3f}"
@@ -308,6 +312,9 @@ for epoch in range(EPOCHS):
             "rollout_gated_gen_ce_top1_cap": ROLLOUT_GATED_GEN_CE_TOP1_CAP,
             "rollout_gated_gen_ce_entropy_margin": ROLLOUT_GATED_GEN_CE_ENTROPY_MARGIN,
             "rollout_gated_gen_ce_decoder": "teacher_decoder" if DECODER_ADAPT else "decoder",
+            "rollout_flow_token_ce_weight": ROLLOUT_FLOW_TOKEN_CE_WEIGHT,
+            "rollout_flow_token_ce_batch": ROLLOUT_FLOW_TOKEN_CE_BATCH,
+            "rollout_flow_token_ce_decoder": "teacher_decoder" if DECODER_ADAPT else "decoder",
             "rollout_target_prob_weight": ROLLOUT_TARGET_PROB_WEIGHT,
             "rollout_target_prob_margin": ROLLOUT_TARGET_PROB_MARGIN,
             "rollout_target_prob_top1_cap": ROLLOUT_TARGET_PROB_TOP1_CAP,
