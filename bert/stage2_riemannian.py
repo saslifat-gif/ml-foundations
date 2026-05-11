@@ -163,6 +163,52 @@ class MetricNet(nn.Module):
         return g_diag / g_diag.mean(dim=-1, keepdim=True).clamp_min(1e-6)
 
 
+class LatentProjector(nn.Module):
+    def __init__(
+        self,
+        latent_dim=256,
+        hidden_dim=512,
+        depth=3,
+        residual_scale=0.10,
+    ):
+        super().__init__()
+        self.residual_scale = residual_scale
+        self.prompt_proj = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.in_proj = nn.Linear(latent_dim * 2, hidden_dim)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim * 2),
+                nn.SiLU(),
+                nn.Linear(hidden_dim * 2, hidden_dim),
+            )
+            for _ in range(depth)
+        ])
+        self.out_norm = nn.LayerNorm(hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, latent_dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, z_gen, z_prompt, mask=None):
+        prompt = z_prompt.mean(dim=1)
+        prompt_h = self.prompt_proj(prompt).unsqueeze(1).expand(-1, z_gen.size(1), -1)
+        h = self.in_proj(torch.cat([z_gen, prompt.unsqueeze(1).expand_as(z_gen)], dim=-1))
+        h = h + prompt_h
+        for block in self.blocks:
+            h = h + block(h)
+            if mask is not None:
+                h = h * mask.to(h.dtype).unsqueeze(-1)
+        delta = self.out_proj(self.out_norm(h))
+        if mask is not None:
+            delta = delta * mask.to(delta.dtype).unsqueeze(-1)
+        return z_gen + self.residual_scale * delta, delta
+
+
 def prompt_condition(z_data, attention_mask, prompt_len=PROMPT_LEN):
     prompt_z = z_data[:, :prompt_len, :]
     prompt_mask = attention_mask[:, :prompt_len].to(prompt_z.dtype).unsqueeze(-1)

@@ -49,9 +49,9 @@ def configure_decoder_adaptation(decoder):
         param.requires_grad = False
     if not DECODER_ADAPT:
         decoder.eval()
-        return []
+        return [], []
 
-    trainable = []
+    head_trainable = []
     for module_name in DECODER_ADAPT_MODULES:
         module = getattr(decoder, module_name, None)
         if module is None:
@@ -59,16 +59,30 @@ def configure_decoder_adaptation(decoder):
             continue
         for param in module.parameters():
             param.requires_grad = True
-            trainable.append(param)
+            head_trainable.append(param)
+
+    bert_trainable = []
+    bert_layers = getattr(getattr(decoder.bert, "encoder", None), "layer", [])
+    n_bert_layers = min(max(0, DECODER_ADAPT_BERT_LAST_N_LAYERS), len(bert_layers))
+    if n_bert_layers > 0:
+        for layer in bert_layers[-n_bert_layers:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+                bert_trainable.append(param)
+
     decoder.train()
     decoder.bert.eval()
+    if n_bert_layers > 0:
+        for layer in bert_layers[-n_bert_layers:]:
+            layer.train()
     decoder.compress.eval()
     print(
         "decoder adapt enabled | trainable="
-        f"{','.join(DECODER_ADAPT_MODULES)} lr={DECODER_ADAPT_LR}",
+        f"{','.join(DECODER_ADAPT_MODULES)} lr={DECODER_ADAPT_LR} "
+        f"bert_last_n={n_bert_layers} bert_lr={DECODER_ADAPT_BERT_LR}",
         flush=True,
     )
-    return trainable
+    return head_trainable, bert_trainable
 
 
 def freeze_module(module):
@@ -111,7 +125,7 @@ teacher_decoder = None
 if DECODER_ADAPT:
     teacher_decoder = copy.deepcopy(decoder).to(device)
     freeze_module(teacher_decoder)
-decoder_adapt_params = configure_decoder_adaptation(decoder)
+decoder_adapt_params, decoder_adapt_bert_params = configure_decoder_adaptation(decoder)
 encoder.eval()
 print(
     "stage1 loaded | encoder frozen | "
@@ -137,6 +151,10 @@ optimizer = AdamW([
 ] + (
     [{"params": decoder_adapt_params, "lr": DECODER_ADAPT_LR}]
     if decoder_adapt_params
+    else []
+) + (
+    [{"params": decoder_adapt_bert_params, "lr": DECODER_ADAPT_BERT_LR}]
+    if decoder_adapt_bert_params
     else []
 ))
 scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
@@ -199,6 +217,11 @@ for epoch in range(EPOCHS):
     if DECODER_ADAPT:
         decoder.train()
         decoder.bert.eval()
+        bert_layers = getattr(getattr(decoder.bert, "encoder", None), "layer", [])
+        n_bert_layers = min(max(0, DECODER_ADAPT_BERT_LAST_N_LAYERS), len(bert_layers))
+        if n_bert_layers > 0:
+            for layer in bert_layers[-n_bert_layers:]:
+                layer.train()
         decoder.compress.eval()
     else:
         decoder.eval()
@@ -237,7 +260,12 @@ for epoch in range(EPOCHS):
         scaler.unscale_(optimizer)
         self_gate_grad, cross_gate_grad = attention_gate_grad_stats(flow_net)
         torch.nn.utils.clip_grad_norm_(
-            list(flow_net.parameters()) + list(metric_net.parameters()) + decoder_adapt_params,
+            (
+                list(flow_net.parameters())
+                + list(metric_net.parameters())
+                + decoder_adapt_params
+                + decoder_adapt_bert_params
+            ),
             max_norm=1.0,
         )
         scaler.step(optimizer)
@@ -267,6 +295,8 @@ for epoch in range(EPOCHS):
                 f" p={stats['rollout_target_prob_gen']:.3f}/{stats['rollout_target_prob_oracle']:.3f}"
                 f" | rnloss {stats['rollout_norm_loss']:.4f}"
                 f" | rdiv {stats['rollout_diversity_loss']:.4f}*{ROLLOUT_DIVERSITY_LOSS_WEIGHT:.3f}={stats['weighted_rollout_diversity_loss']:.4f}"
+                f" | rcos {stats['rollout_cosine_loss']:.4f}*{ROLLOUT_COSINE_LOSS_WEIGHT:.3f}={stats['weighted_rollout_cosine_loss']:.4f}"
+                f" cos={stats['rollout_cosine']:.3f}"
                 f" | dace {stats['decoder_adapt_real_ce']:.4f}*{DECODER_ADAPT_REAL_CE_WEIGHT:.3f}={stats['weighted_decoder_adapt_real_ce']:.4f}"
                 f" | dagce {stats['decoder_adapt_gen_ce']:.4f}*{DECODER_ADAPT_GEN_CE_WEIGHT:.3f}"
                 f"x{stats['decoder_adapt_gen_ce_mult']:.2f}={stats['weighted_decoder_adapt_gen_ce']:.4f}"
@@ -321,6 +351,7 @@ for epoch in range(EPOCHS):
             "rollout_target_prob_decoder": "teacher_decoder" if DECODER_ADAPT else "decoder",
             "rollout_norm_loss_weight": ROLLOUT_NORM_LOSS_WEIGHT,
             "rollout_diversity_loss_weight": ROLLOUT_DIVERSITY_LOSS_WEIGHT,
+            "rollout_cosine_loss_weight": ROLLOUT_COSINE_LOSS_WEIGHT,
             "rollout_diversity_max_tokens": ROLLOUT_DIVERSITY_MAX_TOKENS,
             "rollout_batch": ROLLOUT_BATCH,
             "rollout_train_steps": ROLLOUT_TRAIN_STEPS,
@@ -331,6 +362,8 @@ for epoch in range(EPOCHS):
             "collapse_maxfrac_score_weight": COLLAPSE_MAXFRAC_SCORE_WEIGHT,
             "decoder_adapt": DECODER_ADAPT,
             "decoder_adapt_lr": DECODER_ADAPT_LR,
+            "decoder_adapt_bert_lr": DECODER_ADAPT_BERT_LR,
+            "decoder_adapt_bert_last_n_layers": DECODER_ADAPT_BERT_LAST_N_LAYERS,
             "decoder_adapt_real_ce_weight": DECODER_ADAPT_REAL_CE_WEIGHT,
             "decoder_adapt_gen_ce_weight": DECODER_ADAPT_GEN_CE_WEIGHT,
             "decoder_adapt_gen_ce_ramp_epochs": DECODER_ADAPT_GEN_CE_RAMP_EPOCHS,
@@ -364,7 +397,13 @@ for epoch in range(EPOCHS):
             "seed": SEED,
             "dataloader_num_workers": DATALOADER_NUM_WORKERS,
             "prompt_condition": "riemannian_prompt_prefix",
-            "stage2_arch": "riemannian_metric_flow_decoder_adapt" if DECODER_ADAPT else "riemannian_metric_flow",
+            "stage2_arch": (
+                "riemannian_metric_flow_decoder_body_adapt"
+                if DECODER_ADAPT and DECODER_ADAPT_BERT_LAST_N_LAYERS > 0
+                else "riemannian_metric_flow_decoder_adapt"
+                if DECODER_ADAPT
+                else "riemannian_metric_flow"
+            ),
         }, checkpoint_path)
         print(
             f"saved best model at val score {best_score:.4f} | "

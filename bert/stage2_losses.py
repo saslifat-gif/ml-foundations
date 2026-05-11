@@ -58,6 +58,17 @@ def pairwise_distance_match_loss(z_pred, z_target, mask=None, max_tokens=ROLLOUT
     return F.smooth_l1_loss(pred_dist / scale, target_dist / scale)
 
 
+def rollout_cosine_alignment_loss(z_pred, z_target, mask=None):
+    token_cos = F.cosine_similarity(z_pred.float(), z_target.detach().float(), dim=-1)
+    if mask is not None:
+        valid = mask.bool()
+        if not valid.any():
+            return z_pred.new_tensor(0.0), 0.0
+        token_cos = token_cos[valid]
+    mean_cos = token_cos.mean()
+    return 1.0 - mean_cos, mean_cos.detach().item()
+
+
 def entropy_weight_multiplier(global_step=None, steps_per_epoch=None):
     if global_step is None or not steps_per_epoch:
         return 1.0
@@ -263,6 +274,9 @@ def flow_matching_loss(
                     "rollout_norm_loss": 0.0,
                     "rollout_diversity_loss": 0.0,
                     "weighted_rollout_diversity_loss": 0.0,
+                    "rollout_cosine_loss": 0.0,
+                    "weighted_rollout_cosine_loss": 0.0,
+                    "rollout_cosine": 0.0,
                     "decoder_adapt_real_ce": 0.0,
                     "weighted_decoder_adapt_real_ce": 0.0,
                     "decoder_adapt_gen_ce": 0.0,
@@ -343,6 +357,8 @@ def flow_matching_loss(
     rollout_target_prob_oracle = 0.0
     rollout_norm_loss = z_target.new_tensor(0.0)
     rollout_diversity_loss = z_target.new_tensor(0.0)
+    rollout_cosine_loss = z_target.new_tensor(0.0)
+    rollout_cosine = 0.0
     decoder_adapt_real_ce = z_target.new_tensor(0.0)
     decoder_adapt_gen_ce = z_target.new_tensor(0.0)
     decoder_adapt_preserve_kl = z_target.new_tensor(0.0)
@@ -357,6 +373,7 @@ def flow_matching_loss(
             ROLLOUT_LOSS_WEIGHT > 0
             or ROLLOUT_NORM_LOSS_WEIGHT > 0
             or ROLLOUT_DIVERSITY_LOSS_WEIGHT > 0
+            or ROLLOUT_COSINE_LOSS_WEIGHT > 0
             or ROLLOUT_FLOW_TOKEN_CE_WEIGHT > 0
             or ROLLOUT_GATED_GEN_CE_WEIGHT > 0
             or ROLLOUT_TARGET_PROB_WEIGHT > 0
@@ -393,6 +410,8 @@ def flow_matching_loss(
 
         if ROLLOUT_DIVERSITY_LOSS_WEIGHT > 0:
             rollout_diversity_loss = pairwise_distance_match_loss(z_roll, z_roll_target, roll_mask)
+        if ROLLOUT_COSINE_LOSS_WEIGHT > 0:
+            rollout_cosine_loss, rollout_cosine = rollout_cosine_alignment_loss(z_roll, z_roll_target, roll_mask)
 
         need_entropy_logits = (
             decoder is not None
@@ -509,6 +528,7 @@ def flow_matching_loss(
         + ROLLOUT_TARGET_PROB_WEIGHT * rollout_target_prob_loss
         + ROLLOUT_NORM_LOSS_WEIGHT * rollout_norm_loss
         + ROLLOUT_DIVERSITY_LOSS_WEIGHT * rollout_diversity_loss
+        + ROLLOUT_COSINE_LOSS_WEIGHT * rollout_cosine_loss
         + DECODER_ADAPT_REAL_CE_WEIGHT * decoder_adapt_real_ce
         + (DECODER_ADAPT_GEN_CE_WEIGHT * decoder_adapt_gen_ce_mult) * decoder_adapt_gen_ce
         + DECODER_ADAPT_PRESERVE_KL_WEIGHT * decoder_adapt_preserve_kl
@@ -551,6 +571,9 @@ def flow_matching_loss(
             "rollout_norm_loss": rollout_norm_loss.detach().item(),
             "rollout_diversity_loss": rollout_diversity_loss.detach().item(),
             "weighted_rollout_diversity_loss": (ROLLOUT_DIVERSITY_LOSS_WEIGHT * rollout_diversity_loss).detach().item(),
+            "rollout_cosine_loss": rollout_cosine_loss.detach().item(),
+            "weighted_rollout_cosine_loss": (ROLLOUT_COSINE_LOSS_WEIGHT * rollout_cosine_loss).detach().item(),
+            "rollout_cosine": rollout_cosine,
             "decoder_adapt_real_ce": decoder_adapt_real_ce.detach().item(),
             "weighted_decoder_adapt_real_ce": (DECODER_ADAPT_REAL_CE_WEIGHT * decoder_adapt_real_ce).detach().item(),
             "decoder_adapt_gen_ce": decoder_adapt_gen_ce.detach().item(),
