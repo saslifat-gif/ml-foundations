@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from stage2_config import *
 from stage2_losses import flow_matching_loss
-from stage2_riemannian import generate_suffix, prompt_condition
+from stage2_riemannian import generate_suffix, prompt_condition, suffix_positions
 
 
 def seed_everything(seed):
@@ -70,6 +70,28 @@ def generated_decode_stats(z_real, z_gen_suffix, suffix_mask, input_ids, attn_ma
         ignore_index=0,
     ).item()
     return gen_mean, gen_std, cosine_sim, gen_decode_ce
+
+
+def latent_mix_decode_ce(z_real, z_gen_suffix, input_ids, attn_mask, decoder, device, alphas=(0.01, 0.03, 0.05, 0.10, 0.20, 0.50)):
+    decode_idx = (attn_mask[:, PROMPT_LEN:].sum(dim=1) > 0).nonzero(as_tuple=False).flatten()
+    decode_idx = decode_idx[:DECODE_LOSS_BATCH]
+    if decode_idx.numel() == 0:
+        return []
+    z_real_suffix = z_real[:, PROMPT_LEN:, :]
+    decode_targets = input_ids[decode_idx, PROMPT_LEN:].reshape(-1)
+    results = []
+    for alpha in alphas:
+        z_mix_suffix = (1.0 - alpha) * z_gen_suffix + alpha * z_real_suffix
+        z_mix_seq = torch.cat([z_real[:, :PROMPT_LEN, :], z_mix_suffix], dim=1)[decode_idx]
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+            mix_logits = decoder.decode_from_latent(z_mix_seq)
+        mix_ce = F.cross_entropy(
+            mix_logits[:, PROMPT_LEN:, :].reshape(-1, mix_logits.size(-1)),
+            decode_targets,
+            ignore_index=0,
+        ).item()
+        results.append((alpha, mix_ce))
+    return results
 
 
 def argmax_token_collapse_stats(logits, token_ids, tokenizer):
@@ -189,11 +211,42 @@ def decoder_distribution_stats(logits, tokenizer, mask=None, oracle_logits=None,
     }
 
 
-def evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, device, n_samples=4):
+def fuse_aux_logits(flow_net, aux_token_head, decoder_logits, z_suffix, z_cond, mask=None):
+    if aux_token_head is None or AUX_LOGIT_FUSION_BETA <= 0:
+        return decoder_logits
+    B, T, _ = z_suffix.shape
+    pos = suffix_positions(B, T, z_suffix.device, z_suffix.dtype)
+    t = torch.ones(B, T, device=z_suffix.device, dtype=z_suffix.dtype)
+    _, aux_hidden = flow_net(z_suffix, t, z_cond, pos, mask, return_hidden=True)
+    aux_logits = aux_token_head(aux_hidden).float()
+    fused_logits = decoder_logits.float().clone()
+    fused_logits[:, PROMPT_LEN:, :] = fused_logits[:, PROMPT_LEN:, :] + AUX_LOGIT_FUSION_BETA * aux_logits
+    return fused_logits
+
+
+def evaluate(
+    flow_net,
+    metric_net,
+    encoder,
+    decoder,
+    tokenizer,
+    val_loader,
+    device,
+    n_samples=4,
+    start_mlp=None,
+    aux_token_head=None,
+    latent_projector=None,
+):
     flow_net.eval()
     metric_net.eval()
     encoder.eval()
     decoder.eval()
+    if start_mlp is not None:
+        start_mlp.eval()
+    if aux_token_head is not None:
+        aux_token_head.eval()
+    if latent_projector is not None:
+        latent_projector.eval()
 
     val_loss = 0
     eval_rng_state = torch.random.get_rng_state()
@@ -207,7 +260,14 @@ def evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, devi
                 z_cond = prompt_condition(z_data, attention_mask)
                 z_target = z_data[:, PROMPT_LEN:, :]
                 target_mask = attention_mask[:, PROMPT_LEN:]
-                val_loss += flow_matching_loss(flow_net, metric_net, z_target, z_cond, target_mask).item()
+                val_loss += flow_matching_loss(
+                    flow_net,
+                    metric_net,
+                    z_target,
+                    z_cond,
+                    target_mask,
+                    start_mlp=start_mlp,
+                ).item()
     avg_val_loss = val_loss / len(val_loader)
 
     with torch.no_grad():
@@ -230,8 +290,21 @@ def evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, devi
             D,
             device,
             mask=suffix_mask,
+            start_mlp=start_mlp,
+            z_target_start=z_real_suffix if STRUCTURED_TARGET_START else None,
         )
+        z_projected_suffix = z_gen_suffix
+        if latent_projector is not None:
+            z_projected_suffix, projector_delta = latent_projector(
+                z_gen_suffix,
+                z_real[:, :PROMPT_LEN, :],
+                suffix_mask,
+            )
+            projector_delta_norm = projector_delta[suffix_mask].norm(dim=-1).mean().item()
+        else:
+            projector_delta_norm = 0.0
         z_gen_flat = z_gen_suffix[suffix_mask]
+        z_projected_flat = z_projected_suffix[suffix_mask]
         z_initial_flat = z_initial_suffix[suffix_mask]
         z_uncalibrated_flat = z_uncalibrated_suffix[suffix_mask]
 
@@ -246,13 +319,58 @@ def evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, devi
         uncal_norm = z_uncalibrated_flat.norm(dim=-1).mean().item()
         gen_mean, gen_std, cosine_sim, gen_decode_ce = generated_decode_stats(
             z_real,
-            z_gen_suffix,
+            z_projected_suffix,
             suffix_mask,
             input_ids,
             attn_mask,
             decoder,
             device,
         )
+        mix_decode_ce = latent_mix_decode_ce(
+            z_real,
+            z_gen_suffix,
+            input_ids,
+            attn_mask,
+            decoder,
+            device,
+        )
+        raw_gen_mean = z_gen_flat.mean().item()
+        raw_gen_std = z_gen_flat.std().item()
+        projected_norm = z_projected_flat.norm(dim=-1).mean().item()
+        if start_mlp is not None:
+            pos_start = suffix_positions(B, S - PROMPT_LEN, device, z_real.dtype)
+            z_coarse_suffix = start_mlp(z_cond, pos_start, suffix_mask)
+            coarse_mean, coarse_std, coarse_cosine, coarse_decode_ce = generated_decode_stats(
+                z_real,
+                z_coarse_suffix,
+                suffix_mask,
+                input_ids,
+                attn_mask,
+                decoder,
+                device,
+            )
+            coarse_mse = F.mse_loss(z_coarse_suffix[suffix_mask], z_real_suffix[suffix_mask]).item()
+            coarse_decode_idx = (attn_mask[:, PROMPT_LEN:].sum(dim=1) > 0).nonzero(as_tuple=False).flatten()
+            coarse_decode_idx = coarse_decode_idx[:DECODE_LOSS_BATCH]
+            if coarse_decode_idx.numel() > 0:
+                coarse_seq = torch.cat([z_real[:, :PROMPT_LEN, :], z_coarse_suffix], dim=1)[coarse_decode_idx]
+                coarse_targets = input_ids[coarse_decode_idx, PROMPT_LEN:]
+                coarse_valid = coarse_targets != 0
+                with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                    coarse_logits = decoder.decode_from_latent(coarse_seq)[:, PROMPT_LEN:, :].float()
+                coarse_probs = coarse_logits.softmax(dim=-1)
+                coarse_target_ids = coarse_targets.clamp(0, coarse_probs.size(-1) - 1).unsqueeze(-1)
+                coarse_target_probs = coarse_probs.gather(dim=-1, index=coarse_target_ids).squeeze(-1)
+                coarse_target_prob = coarse_target_probs[coarse_valid].mean().item() if coarse_valid.any() else 0.0
+            else:
+                coarse_target_prob = 0.0
+        else:
+            coarse_mean = 0.0
+            coarse_std = 0.0
+            coarse_cosine = 0.0
+            coarse_decode_ce = 0.0
+            coarse_mse = 0.0
+            coarse_target_prob = 0.0
         _, _, _, initial_decode_ce = generated_decode_stats(
             z_real,
             z_initial_suffix,
@@ -281,24 +399,49 @@ def evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, devi
         decode_idx = decode_idx[:DECODE_LOSS_BATCH]
         if decode_idx.numel() > 0:
             z_decode_real = z_real[decode_idx]
+            z_decode_gen = torch.cat([z_real[:, :PROMPT_LEN, :], z_projected_suffix], dim=1)[decode_idx]
             decode_targets = input_ids[decode_idx, PROMPT_LEN:].reshape(-1)
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 real_decode_logits = decoder.decode_from_latent(z_decode_real)
+                gen_decode_logits = decoder.decode_from_latent(z_decode_gen)
+                fused_decode_logits = fuse_aux_logits(
+                    flow_net,
+                    aux_token_head,
+                    gen_decode_logits,
+                    z_projected_suffix[decode_idx],
+                    z_cond[decode_idx],
+                    suffix_mask[decode_idx],
+                )
             real_decode_ce = F.cross_entropy(
                 real_decode_logits[:, PROMPT_LEN:, :].reshape(-1, real_decode_logits.size(-1)),
                 decode_targets,
                 ignore_index=0,
             ).item()
+            fused_decode_ce = F.cross_entropy(
+                fused_decode_logits[:, PROMPT_LEN:, :].reshape(-1, fused_decode_logits.size(-1)),
+                decode_targets,
+                ignore_index=0,
+            ).item()
         else:
             real_decode_ce = 0.0
+            fused_decode_ce = gen_decode_ce
         decode_ce_gap = gen_decode_ce - real_decode_ce
+        fused_decode_ce_gap = fused_decode_ce - real_decode_ce
 
     with torch.no_grad():
         sample_idx = (attn_mask[:, PROMPT_LEN:].sum(dim=1) > 0).nonzero(as_tuple=False).flatten()
         sample_idx = sample_idx[:n_samples]
-        z_gen_seq = torch.cat([z_real[:, :PROMPT_LEN, :], z_gen_suffix], dim=1)[sample_idx]
+        z_gen_seq = torch.cat([z_real[:, :PROMPT_LEN, :], z_projected_suffix], dim=1)[sample_idx]
         with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-            logits = decoder.decode_from_latent(z_gen_seq)
+            raw_logits = decoder.decode_from_latent(z_gen_seq)
+            logits = fuse_aux_logits(
+                flow_net,
+                aux_token_head,
+                raw_logits,
+                z_projected_suffix[sample_idx],
+                z_cond[sample_idx],
+                attn_mask[sample_idx, PROMPT_LEN:],
+            )
             oracle_logits = decoder.decode_from_latent(z_real[sample_idx])
         pred_ids = logits.argmax(-1)
         sampled_ids = sample_token_ids(logits, tokenizer)
@@ -310,6 +453,13 @@ def evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, devi
         sample_target_ids = input_ids[sample_idx]
         gen_dist = decoder_distribution_stats(
             logits,
+            tokenizer,
+            sample_suffix_mask,
+            oracle_logits=oracle_logits,
+            target_ids=sample_target_ids,
+        )
+        raw_gen_dist = decoder_distribution_stats(
+            raw_logits,
             tokenizer,
             sample_suffix_mask,
             oracle_logits=oracle_logits,
@@ -366,6 +516,11 @@ def evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, devi
             f"oracle_to_gen_kl={gen_dist['kl_to_oracle']:.3f}"
         )
         print(
+            "  target raw    : "
+            f"top1_acc={raw_gen_dist['top1_acc']:.3f} "
+            f"target_prob={raw_gen_dist['target_prob']:.4f}"
+        )
+        print(
             "  target gen    : "
             f"top1_acc={gen_dist['top1_acc']:.3f} "
             f"target_prob={gen_dist['target_prob']:.4f} "
@@ -397,7 +552,7 @@ def evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, devi
         avg_val_loss
         + latent_std_gap
         + max(0.0, 0.8 - cosine_sim)
-        + 0.05 * max(0.0, decode_ce_gap)
+        + 0.05 * max(0.0, fused_decode_ce_gap if aux_token_head is not None else decode_ce_gap)
         + RAW_NORM_GAP_SCORE_WEIGHT * raw_norm_gap
         + COLLAPSE_UNIQ_SCORE_WEIGHT * collapse_uniq_penalty
         + COLLAPSE_MAXFRAC_SCORE_WEIGHT * collapse_maxfrac_penalty
@@ -407,11 +562,21 @@ def evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, devi
     print(f"  val loss     : {avg_val_loss:.4f}")
     print(f"  real latents : mean={real_mean:.3f}  std={real_std:.3f}  norm={real_norm:.3f}")
     print(f"  gen latents  : mean={gen_mean:.3f}  std={gen_std:.3f}")
+    if start_mlp is not None:
+        print(f"  coarse start : mean={coarse_mean:.3f}  std={coarse_std:.3f}  mse={coarse_mse:.4f}  cos={coarse_cosine:.4f}  ce={coarse_decode_ce:.4f}  p={coarse_target_prob:.4f}")
+    if latent_projector is not None:
+        print(f"  raw gen lat  : mean={raw_gen_mean:.3f}  std={raw_gen_std:.3f}")
+        print(f"  projector    : delta_norm={projector_delta_norm:.3f}  proj_norm={projected_norm:.3f}")
     print(f"  init latents : mean={initial_mean:.3f}  std={initial_std:.3f}  norm={initial_norm:.3f}")
     print(f"  raw flow lat : mean={uncal_mean:.3f}  std={uncal_std:.3f}  norm={uncal_norm:.3f}  norm_gap={raw_norm_gap:.3f}")
     print(f"  metric diag  : mean={metric_mean:.3f}  std={metric_std:.3f}  min={metric_min:.3f}  max={metric_max:.3f}")
     print(f"  cosine sim   : {cosine_sim:.4f}")
     print(f"  decoder CE   : real={real_decode_ce:.4f}  init={initial_decode_ce:.4f}  raw={uncal_decode_ce:.4f}  gen={gen_decode_ce:.4f}  gap={decode_ce_gap:.4f}")
+    if aux_token_head is not None:
+        print(f"  fused CE     : beta={AUX_LOGIT_FUSION_BETA:.3f}  gen={fused_decode_ce:.4f}  gap={fused_decode_ce_gap:.4f}")
+    if mix_decode_ce:
+        mix_text = "  ".join(f"a={alpha:.2f}:{ce:.3f}" for alpha, ce in mix_decode_ce)
+        print(f"  mix CE raw   : {mix_text}")
     print(f"  collapse pen : uniq={collapse_uniq_penalty:.4f}  maxfrac={collapse_maxfrac_penalty:.4f}")
     print(f"  ode steps    : {ODE_STEPS}")
     print(f"  val score    : {val_score:.4f}")

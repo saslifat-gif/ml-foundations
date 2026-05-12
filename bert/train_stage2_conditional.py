@@ -14,8 +14,14 @@ from stage2_data import build_stage2_dataloaders
 from stage2_eval import evaluate
 from stage2_losses import flow_matching_loss
 from stage2_riemannian import (
+    AuxTokenHead,
+    DenoisingPrior,
+    DenoisingPriorSampler,
     FlowNet,
+    LatentProjector,
     MetricNet,
+    StartMLP,
+    StartTransformer,
     attention_gate_grad_stats,
     attention_gate_parameters,
     non_gate_flow_parameters,
@@ -47,7 +53,7 @@ def atomic_torch_save(obj, path):
 def configure_decoder_adaptation(decoder):
     for param in decoder.parameters():
         param.requires_grad = False
-    if not DECODER_ADAPT:
+    if not DECODER_ADAPT or (LATENT_PROJECTOR and LATENT_PROJECTOR_ONLY):
         decoder.eval()
         return [], []
 
@@ -107,6 +113,15 @@ print(
     f"train_size={TRAIN_SIZE} batch={TRAIN_BATCH_SIZE} "
     f"flow={FLOW_HIDDEN_DIM}x{FLOW_DEPTH} metric={METRIC_HIDDEN_DIM} "
     f"flow_token_ce={ROLLOUT_FLOW_TOKEN_CE_WEIGHT}x{ROLLOUT_FLOW_TOKEN_CE_BATCH} "
+    f"fused_ce={FUSED_TOKEN_CE_WEIGHT}x{FUSED_TOKEN_CE_BATCH} beta={AUX_LOGIT_FUSION_BETA} "
+    f"structured_start={STRUCTURED_TARGET_START} alpha={STRUCTURED_START_ALPHA} "
+    f"start_mlp={START_MLP} start_transformer={START_TRANSFORMER} "
+    f"denoising_prior={DENOISING_PRIOR} dp_alpha={DENOISING_PRIOR_ALPHA} dp_frozen={DENOISING_PRIOR_FROZEN} "
+    f"start_noise={START_NOISE_STD_FRAC} "
+    f"aux_token={AUX_TOKEN_CE_WEIGHT} shared_block={TOKEN_SHARED_BLOCK}x{TOKEN_SHARED_BLOCK_SCALE} "
+    f"token_residual={TOKEN_RESIDUAL_SCALE} "
+    f"projector={LATENT_PROJECTOR} projector_only={LATENT_PROJECTOR_ONLY} reset={LATENT_PROJECTOR_RESET} "
+    f"decoder_flow_joint={DECODER_FLOW_JOINT} decoder_generated_adapt_only={DECODER_GENERATED_ADAPT_ONLY} "
     f"compile={COMPILE_MODELS} fast_debug={FAST_DEBUG}",
     flush=True,
 )
@@ -143,11 +158,65 @@ train_loader, val_loader = build_stage2_dataloaders(
 
 flow_net = FlowNet(latent_dim=256, hidden_dim=FLOW_HIDDEN_DIM, depth=FLOW_DEPTH).to(device)
 metric_net = MetricNet(latent_dim=256, hidden_dim=METRIC_HIDDEN_DIM).to(device)
+if DENOISING_PRIOR:
+    _dp_ckpt = torch.load(DENOISING_PRIOR_PATH, map_location=device, weights_only=False)
+    _dp = DenoisingPrior(
+        latent_dim=256,
+        hidden_dim=_dp_ckpt.get("denoising_hidden_dim", START_TRANSFORMER_HIDDEN_DIM),
+        num_layers=_dp_ckpt.get("denoising_layers", START_TRANSFORMER_LAYERS),
+        num_heads=_dp_ckpt.get("denoising_heads", START_TRANSFORMER_HEADS),
+    ).to(device)
+    _dp.load_state_dict(_dp_ckpt["denoising_prior"])
+    if DENOISING_PRIOR_FROZEN:
+        freeze_module(_dp)
+    start_mlp = DenoisingPriorSampler(_dp, latent_dim=256, alpha=DENOISING_PRIOR_ALPHA).to(device)
+    print(
+        f"denoising prior loaded from {DENOISING_PRIOR_PATH} | "
+        f"alpha={DENOISING_PRIOR_ALPHA} frozen={DENOISING_PRIOR_FROZEN}",
+        flush=True,
+    )
+elif START_TRANSFORMER:
+    start_mlp = StartTransformer(
+        latent_dim=256,
+        num_layers=START_TRANSFORMER_LAYERS,
+        num_heads=START_TRANSFORMER_HEADS,
+        ffn_dim=START_TRANSFORMER_HIDDEN_DIM,
+    ).to(device)
+elif START_MLP:
+    start_mlp = StartMLP(latent_dim=256, hidden_dim=START_MLP_HIDDEN_DIM).to(device)
+else:
+    start_mlp = None
+aux_token_head = (
+    AuxTokenHead(hidden_dim=AUX_TOKEN_HIDDEN_DIM, vocab_size=tokenizer.vocab_size).to(device)
+    if AUX_TOKEN_CE_WEIGHT > 0
+    else None
+)
+latent_projector = (
+    LatentProjector(
+        latent_dim=256,
+        hidden_dim=LATENT_PROJECTOR_HIDDEN_DIM,
+        depth=LATENT_PROJECTOR_DEPTH,
+        residual_scale=LATENT_PROJECTOR_RES_SCALE,
+    ).to(device)
+    if LATENT_PROJECTOR
+    else None
+)
+
+if (LATENT_PROJECTOR and LATENT_PROJECTOR_ONLY) or DECODER_GENERATED_ADAPT_ONLY:
+    freeze_module(flow_net)
+    freeze_module(metric_net)
+    if LATENT_PROJECTOR and LATENT_PROJECTOR_ONLY:
+        freeze_module(decoder)
+        print("latent projector only | flow/metric/decoder frozen", flush=True)
+    else:
+        print("decoder generated adapt only | flow/metric frozen", flush=True)
 
 optimizer = AdamW([
     {"params": non_gate_flow_parameters(flow_net), "lr": 1e-4},
     {"params": attention_gate_parameters(flow_net), "lr": 1e-4 * GATE_LR_MULT},
     {"params": metric_net.parameters(), "lr": 5e-5},
+    *([{"params": [p for p in start_mlp.parameters() if p.requires_grad], "lr": START_TRANSFORMER_LR if START_TRANSFORMER else START_MLP_LR}] if start_mlp is not None and any(p.requires_grad for p in start_mlp.parameters()) else []),
+    *([{"params": aux_token_head.parameters(), "lr": 1e-4}] if aux_token_head is not None else []),
 ] + (
     [{"params": decoder_adapt_params, "lr": DECODER_ADAPT_LR}]
     if decoder_adapt_params
@@ -156,24 +225,92 @@ optimizer = AdamW([
     [{"params": decoder_adapt_bert_params, "lr": DECODER_ADAPT_BERT_LR}]
     if decoder_adapt_bert_params
     else []
+) + (
+    [{"params": latent_projector.parameters(), "lr": LATENT_PROJECTOR_LR}]
+    if latent_projector is not None
+    else []
 ))
+projector_param_count = (
+    sum(p.numel() for p in latent_projector.parameters() if p.requires_grad)
+    if latent_projector is not None
+    else 0
+)
+aux_param_count = (
+    sum(p.numel() for p in aux_token_head.parameters() if p.requires_grad)
+    if aux_token_head is not None
+    else 0
+)
+start_param_count = (
+    sum(p.numel() for p in start_mlp.parameters() if p.requires_grad)
+    if start_mlp is not None
+    else 0
+)
+optimizer_param_count = sum(
+    p.numel()
+    for group in optimizer.param_groups
+    for p in group["params"]
+    if p.requires_grad
+)
+print(
+    f"optimizer params | projector_trainable={projector_param_count} "
+    f"start_trainable={start_param_count} "
+    f"aux_trainable={aux_param_count} "
+    f"optimizer_trainable={optimizer_param_count}",
+    flush=True,
+)
 scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 best_score = float("inf")
 checkpoint_path = (
+    "stage2_conditional_projector_best.pt"
+    if LATENT_PROJECTOR
+    else
+    "stage2_conditional_flow_decoder_joint_best.pt"
+    if DECODER_FLOW_JOINT
+    else
+    "stage2_conditional_decoder_generated_adapt_best.pt"
+    if DECODER_GENERATED_ADAPT_ONLY
+    else
     "stage2_conditional_decoder_adapt_best.pt"
     if DECODER_ADAPT
     else "stage2_conditional_best.pt"
 )
 
 if RESUME:
+    loaded_checkpoint_path = (
+        "stage2_conditional_decoder_adapt_best.pt"
+        if LATENT_PROJECTOR and LATENT_PROJECTOR_RESET
+        else checkpoint_path
+    )
     try:
-        ckpt2 = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        ckpt2 = torch.load(loaded_checkpoint_path, map_location=device, weights_only=False)
     except Exception as exc:
-        ckpt2 = None
-        print(
-            f"could not load {checkpoint_path} ({exc}) | training stage2 from scratch",
-            flush=True,
+        fallback_path = (
+            "stage2_conditional_decoder_adapt_best.pt"
+            if (LATENT_PROJECTOR or DECODER_GENERATED_ADAPT_ONLY or DECODER_FLOW_JOINT)
+            and loaded_checkpoint_path != "stage2_conditional_decoder_adapt_best.pt"
+            else None
         )
+        if fallback_path is not None and fallback_path != checkpoint_path:
+            try:
+                ckpt2 = torch.load(fallback_path, map_location=device, weights_only=False)
+                loaded_checkpoint_path = fallback_path
+                print(
+                    f"could not load {checkpoint_path} ({exc}) | "
+                    f"initializing projector from {fallback_path}",
+                    flush=True,
+                )
+            except Exception as fallback_exc:
+                ckpt2 = None
+                print(
+                    f"could not load {checkpoint_path} ({exc}) or {fallback_path} ({fallback_exc})",
+                    flush=True,
+                )
+        else:
+            ckpt2 = None
+            print(
+                f"could not load {checkpoint_path} ({exc}) | training stage2 from scratch",
+                flush=True,
+            )
 
     if ckpt2 is not None:
         try:
@@ -189,19 +326,41 @@ if RESUME:
                 encoder.load_state_dict(ckpt2["encoder"])
             if DECODER_ADAPT and "decoder" in ckpt2:
                 decoder.load_state_dict(ckpt2["decoder"])
-            if "best_score" in ckpt2 and "metric_net" in ckpt2:
+                if LATENT_PROJECTOR and LATENT_PROJECTOR_ONLY:
+                    freeze_module(decoder)
+                if DECODER_GENERATED_ADAPT_ONLY and teacher_decoder is not None:
+                    teacher_decoder = copy.deepcopy(decoder).to(device)
+                    freeze_module(teacher_decoder)
+            if latent_projector is not None and "latent_projector" in ckpt2 and not LATENT_PROJECTOR_RESET:
+                latent_projector.load_state_dict(ckpt2["latent_projector"])
+            if start_mlp is not None and "start_mlp" in ckpt2 and ckpt2["start_mlp"] is not None:
+                start_mlp.load_state_dict(ckpt2["start_mlp"])
+            if aux_token_head is not None and "aux_token_head" in ckpt2 and ckpt2["aux_token_head"] is not None:
+                aux_token_head.load_state_dict(ckpt2["aux_token_head"])
+            if (
+                LATENT_PROJECTOR
+                and (LATENT_PROJECTOR_RESET or "latent_projector" not in ckpt2 or loaded_checkpoint_path != checkpoint_path)
+            ):
+                best_score = float("inf")
+                print("initializing fresh latent_projector | resetting best_score")
+            elif "best_score" in ckpt2 and "metric_net" in ckpt2:
                 best_score = ckpt2["best_score"]
             elif "best_loss" in ckpt2 and "metric_net" in ckpt2:
                 best_score = ckpt2["best_loss"]
             if ckpt2.get("metric_bound_fn") != "tanh":
                 best_score = float("inf")
                 print("checkpoint used hard metric clamp | resetting best_score for smooth-bound run")
-            print(f"resumed from {checkpoint_path} | best_score={best_score:.4f}")
+            print(f"resumed from {loaded_checkpoint_path} | best_score={best_score:.4f}")
         except RuntimeError as exc:
             print(f"checkpoint architecture mismatch ({exc}) | training stage2 from scratch")
             best_score = float("inf")
+    elif LATENT_PROJECTOR and LATENT_PROJECTOR_ONLY:
+        raise RuntimeError("LATENT_PROJECTOR_ONLY requires an existing stage2 checkpoint to project from")
 else:
     print("training from scratch")
+
+if LATENT_PROJECTOR and LATENT_PROJECTOR_ONLY and not RESUME:
+    raise RuntimeError("LATENT_PROJECTOR_ONLY requires RESUME=True and a trained stage2 checkpoint")
 
 if COMPILE_MODELS:
     flow_net = torch.compile(flow_net)
@@ -211,10 +370,28 @@ else:
     print("torch.compile disabled")
 
 for epoch in range(EPOCHS):
-    flow_net.train()
-    metric_net.train()
+    if (LATENT_PROJECTOR and LATENT_PROJECTOR_ONLY) or DECODER_GENERATED_ADAPT_ONLY:
+        flow_net.eval()
+        metric_net.eval()
+        if aux_token_head is not None:
+            aux_token_head.train()
+        if start_mlp is not None:
+            start_mlp.train()
+        if latent_projector is not None:
+            latent_projector.train()
+    else:
+        flow_net.train()
+        metric_net.train()
+        if aux_token_head is not None:
+            aux_token_head.train()
+        if start_mlp is not None:
+            start_mlp.train()
+        if latent_projector is not None:
+            latent_projector.train()
     encoder.eval()
-    if DECODER_ADAPT:
+    if LATENT_PROJECTOR and LATENT_PROJECTOR_ONLY:
+        decoder.eval()
+    elif DECODER_ADAPT:
         decoder.train()
         decoder.bert.eval()
         bert_layers = getattr(getattr(decoder.bert, "encoder", None), "layer", [])
@@ -246,10 +423,13 @@ for epoch in range(EPOCHS):
                 z_target,
                 z_cond,
                 target_mask,
+                aux_token_head=aux_token_head,
                 decoder=decoder,
                 z_prompt=z_data[:, :PROMPT_LEN, :],
                 suffix_ids=input_ids[:, PROMPT_LEN:],
                 teacher_decoder=teacher_decoder,
+                start_mlp=start_mlp,
+                latent_projector=latent_projector,
                 return_stats=True,
                 global_step=epoch * len(train_loader) + step,
                 steps_per_epoch=len(train_loader),
@@ -259,12 +439,28 @@ for epoch in range(EPOCHS):
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         self_gate_grad, cross_gate_grad = attention_gate_grad_stats(flow_net)
+        if latent_projector is not None:
+            projector_grad_terms = [
+                param.grad.detach().float().pow(2).sum()
+                for param in latent_projector.parameters()
+                if param.grad is not None
+            ]
+            projector_grad_norm = (
+                torch.sqrt(torch.stack(projector_grad_terms).sum()).item()
+                if projector_grad_terms
+                else 0.0
+            )
+        else:
+            projector_grad_norm = 0.0
         torch.nn.utils.clip_grad_norm_(
             (
                 list(flow_net.parameters())
                 + list(metric_net.parameters())
+                + (list(start_mlp.parameters()) if start_mlp is not None else [])
+                + (list(aux_token_head.parameters()) if aux_token_head is not None else [])
                 + decoder_adapt_params
                 + decoder_adapt_bert_params
+                + (list(latent_projector.parameters()) if latent_projector is not None else [])
             ),
             max_norm=1.0,
         )
@@ -280,6 +476,20 @@ for epoch in range(EPOCHS):
                 f" | eloss {stats['euclidean_loss']:.4f}"
                 f" | x0 {stats['x0_loss']:.4f}"
                 f" | dloss {stats['decode_loss']:.4f}*{DECODE_LOSS_WEIGHT:.3f}={stats['weighted_decode_loss']:.4f}"
+                f" | auxce {stats['aux_token_ce']:.4f}*{AUX_TOKEN_CE_WEIGHT:.3f}={stats['weighted_aux_token_ce']:.4f}"
+                f" acc={stats['aux_token_acc']:.3f}"
+                f" p={stats['aux_token_target_prob']:.3f}"
+                f" | smse {stats['start_mse_loss']:.4f}*{START_MLP_MSE_WEIGHT:.2f}={stats['weighted_start_mse_loss']:.4f}"
+                f" | scos {stats['start_cosine_loss']:.4f}*{START_MLP_COSINE_WEIGHT:.2f}={stats['weighted_start_cosine_loss']:.4f}"
+                f" cos={stats['start_cosine']:.3f}"
+                f" | sce {stats['start_token_ce']:.4f}*{START_MLP_TOKEN_CE_WEIGHT:.2f}={stats['weighted_start_token_ce']:.4f}"
+                f" p={stats['start_target_prob']:.3f}"
+                f" sig={stats['start_noise_std']:.4f}"
+                f" a={stats['structured_start_alpha']:.2f}"
+                f" | tblk {stats['token_block_norm']:.4f}/{stats['token_hidden_norm']:.4f}"
+                f" r={stats['token_block_ratio']:.4f}"
+                f" | vout {stats['velocity_out_norm']:.4f}"
+                f" w={stats['out_proj_weight_norm']:.4f}"
                 f" | rollout {stats['rollout_loss']:.4f}"
                 f" | entgap {stats['rollout_entropy_loss']:.4f}*{ROLLOUT_ENTROPY_LOSS_WEIGHT:.3f}={stats['weighted_rollout_entropy_loss']:.4f}"
                 f" ent g/o={stats['rollout_gen_entropy']:.2f}/{stats['rollout_oracle_entropy']:.2f}"
@@ -290,6 +500,9 @@ for epoch in range(EPOCHS):
                 f" | rfce {stats['rollout_flow_token_ce']:.4f}*{ROLLOUT_FLOW_TOKEN_CE_WEIGHT:.3f}={stats['weighted_rollout_flow_token_ce']:.4f}"
                 f" p={stats['rollout_flow_token_ce_target_prob']:.3f}"
                 f" top1={stats['rollout_flow_token_ce_top1']:.3f}"
+                f" | fce {stats['fused_token_ce']:.4f}*{FUSED_TOKEN_CE_WEIGHT:.3f}={stats['weighted_fused_token_ce']:.4f}"
+                f" p={stats['fused_token_target_prob']:.3f}"
+                f" top1={stats['fused_token_top1']:.3f}"
                 f" | rtp {stats['rollout_target_prob_loss']:.4f}*{ROLLOUT_TARGET_PROB_WEIGHT:.3f}={stats['weighted_rollout_target_prob_loss']:.4f}"
                 f" act={stats['rollout_target_prob_active']:.2f}"
                 f" p={stats['rollout_target_prob_gen']:.3f}/{stats['rollout_target_prob_oracle']:.3f}"
@@ -297,6 +510,16 @@ for epoch in range(EPOCHS):
                 f" | rdiv {stats['rollout_diversity_loss']:.4f}*{ROLLOUT_DIVERSITY_LOSS_WEIGHT:.3f}={stats['weighted_rollout_diversity_loss']:.4f}"
                 f" | rcos {stats['rollout_cosine_loss']:.4f}*{ROLLOUT_COSINE_LOSS_WEIGHT:.3f}={stats['weighted_rollout_cosine_loss']:.4f}"
                 f" cos={stats['rollout_cosine']:.3f}"
+                f" | pmse {stats['projector_mse_loss']:.4f}*{LATENT_PROJECTOR_MSE_WEIGHT:.3f}={stats['weighted_projector_mse_loss']:.4f}"
+                f" | pcos {stats['projector_cosine_loss']:.4f}*{LATENT_PROJECTOR_COSINE_WEIGHT:.3f}={stats['weighted_projector_cosine_loss']:.4f}"
+                f" cos={stats['projector_cosine']:.3f}"
+                f" | pce {stats['projector_token_ce']:.4f}*{LATENT_PROJECTOR_TOKEN_CE_WEIGHT:.3f}={stats['weighted_projector_token_ce']:.4f}"
+                f" p={stats['projector_target_prob']:.3f}"
+                f" | preg {stats['projector_delta_reg']:.4f}*{LATENT_PROJECTOR_DELTA_REG_WEIGHT:.3f}={stats['weighted_projector_delta_reg']:.4f}"
+                f" dnorm={stats['projector_delta_norm']:.6f}"
+                f" dabs={stats['projector_delta_abs_mean']:.6f}/{stats['projector_delta_abs_max']:.6f}"
+                f" zstd={stats['projector_z_std']:.4f}"
+                f" pgrad={projector_grad_norm:.2e}"
                 f" | dace {stats['decoder_adapt_real_ce']:.4f}*{DECODER_ADAPT_REAL_CE_WEIGHT:.3f}={stats['weighted_decoder_adapt_real_ce']:.4f}"
                 f" | dagce {stats['decoder_adapt_gen_ce']:.4f}*{DECODER_ADAPT_GEN_CE_WEIGHT:.3f}"
                 f"x{stats['decoder_adapt_gen_ce_mult']:.2f}={stats['weighted_decoder_adapt_gen_ce']:.4f}"
@@ -314,15 +537,29 @@ for epoch in range(EPOCHS):
     avg_loss = train_loss / len(train_loader)
     print(f"\nepoch {epoch+1} done | avg train loss {avg_loss:.4f}", flush=True)
 
-    avg_val_loss, val_score = evaluate(flow_net, metric_net, encoder, decoder, tokenizer, val_loader, device)
+    avg_val_loss, val_score = evaluate(
+        flow_net,
+        metric_net,
+        encoder,
+        decoder,
+        tokenizer,
+        val_loader,
+        device,
+        start_mlp=start_mlp,
+        aux_token_head=aux_token_head,
+        latent_projector=latent_projector,
+    )
 
     if val_score < best_score:
         best_score = val_score
         atomic_torch_save({
             "flow_net": flow_net.state_dict(),
             "metric_net": metric_net.state_dict(),
+            "start_mlp": start_mlp.state_dict() if start_mlp is not None else None,
+            "aux_token_head": aux_token_head.state_dict() if aux_token_head is not None else None,
             "encoder": encoder.state_dict(),
             "decoder": decoder.state_dict(),
+            "latent_projector": latent_projector.state_dict() if latent_projector is not None else None,
             "best_loss": avg_val_loss,
             "best_score": best_score,
             "metric_loss_weight": METRIC_LOSS_WEIGHT,
@@ -345,6 +582,9 @@ for epoch in range(EPOCHS):
             "rollout_flow_token_ce_weight": ROLLOUT_FLOW_TOKEN_CE_WEIGHT,
             "rollout_flow_token_ce_batch": ROLLOUT_FLOW_TOKEN_CE_BATCH,
             "rollout_flow_token_ce_decoder": "teacher_decoder" if DECODER_ADAPT else "decoder",
+            "fused_token_ce_weight": FUSED_TOKEN_CE_WEIGHT,
+            "fused_token_ce_batch": FUSED_TOKEN_CE_BATCH,
+            "aux_logit_fusion_beta": AUX_LOGIT_FUSION_BETA,
             "rollout_target_prob_weight": ROLLOUT_TARGET_PROB_WEIGHT,
             "rollout_target_prob_margin": ROLLOUT_TARGET_PROB_MARGIN,
             "rollout_target_prob_top1_cap": ROLLOUT_TARGET_PROB_TOP1_CAP,
@@ -355,12 +595,50 @@ for epoch in range(EPOCHS):
             "rollout_diversity_max_tokens": ROLLOUT_DIVERSITY_MAX_TOKENS,
             "rollout_batch": ROLLOUT_BATCH,
             "rollout_train_steps": ROLLOUT_TRAIN_STEPS,
+            "structured_target_start": STRUCTURED_TARGET_START,
+            "structured_start_alpha": STRUCTURED_START_ALPHA,
+            "start_mlp": START_MLP,
+            "start_mlp_hidden_dim": START_MLP_HIDDEN_DIM,
+            "start_transformer": START_TRANSFORMER,
+            "denoising_prior": DENOISING_PRIOR,
+            "denoising_prior_path": DENOISING_PRIOR_PATH,
+            "denoising_prior_alpha": DENOISING_PRIOR_ALPHA,
+            "denoising_prior_frozen": DENOISING_PRIOR_FROZEN,
+            "start_transformer_layers": START_TRANSFORMER_LAYERS,
+            "start_transformer_heads": START_TRANSFORMER_HEADS,
+            "start_transformer_hidden_dim": START_TRANSFORMER_HIDDEN_DIM,
+            "start_transformer_lr": START_TRANSFORMER_LR,
+            "start_noise_std_frac": START_NOISE_STD_FRAC,
+            "start_mlp_lr": START_MLP_LR,
+            "start_mlp_mse_weight": START_MLP_MSE_WEIGHT,
+            "start_mlp_cosine_weight": START_MLP_COSINE_WEIGHT,
+            "start_mlp_token_ce_weight": START_MLP_TOKEN_CE_WEIGHT,
+            "aux_token_ce_weight": AUX_TOKEN_CE_WEIGHT,
+            "aux_token_hidden_dim": AUX_TOKEN_HIDDEN_DIM,
+            "aux_token_batch": AUX_TOKEN_BATCH,
+            "token_shared_block": TOKEN_SHARED_BLOCK,
+            "token_shared_block_scale": TOKEN_SHARED_BLOCK_SCALE,
+            "token_residual_scale": TOKEN_RESIDUAL_SCALE,
+            "latent_projector": LATENT_PROJECTOR,
+            "latent_projector_only": LATENT_PROJECTOR_ONLY,
+            "latent_projector_reset": LATENT_PROJECTOR_RESET,
+            "latent_projector_hidden_dim": LATENT_PROJECTOR_HIDDEN_DIM,
+            "latent_projector_depth": LATENT_PROJECTOR_DEPTH,
+            "latent_projector_res_scale": LATENT_PROJECTOR_RES_SCALE,
+            "latent_projector_lr": LATENT_PROJECTOR_LR,
+            "latent_projector_mse_weight": LATENT_PROJECTOR_MSE_WEIGHT,
+            "latent_projector_cosine_weight": LATENT_PROJECTOR_COSINE_WEIGHT,
+            "latent_projector_token_ce_weight": LATENT_PROJECTOR_TOKEN_CE_WEIGHT,
+            "latent_projector_delta_reg_weight": LATENT_PROJECTOR_DELTA_REG_WEIGHT,
             "raw_norm_gap_score_weight": RAW_NORM_GAP_SCORE_WEIGHT,
             "collapse_uniq_target": COLLAPSE_UNIQ_TARGET,
             "collapse_maxfrac_target": COLLAPSE_MAXFRAC_TARGET,
             "collapse_uniq_score_weight": COLLAPSE_UNIQ_SCORE_WEIGHT,
             "collapse_maxfrac_score_weight": COLLAPSE_MAXFRAC_SCORE_WEIGHT,
             "decoder_adapt": DECODER_ADAPT,
+            "decoder_flow_joint": DECODER_FLOW_JOINT,
+            "decoder_generated_adapt_only": DECODER_GENERATED_ADAPT_ONLY,
+            "decoder_adapt_detach_generated": DECODER_ADAPT_DETACH_GENERATED,
             "decoder_adapt_lr": DECODER_ADAPT_LR,
             "decoder_adapt_bert_lr": DECODER_ADAPT_BERT_LR,
             "decoder_adapt_bert_last_n_layers": DECODER_ADAPT_BERT_LAST_N_LAYERS,
@@ -398,6 +676,15 @@ for epoch in range(EPOCHS):
             "dataloader_num_workers": DATALOADER_NUM_WORKERS,
             "prompt_condition": "riemannian_prompt_prefix",
             "stage2_arch": (
+                "riemannian_metric_flow_latent_projector"
+                if LATENT_PROJECTOR
+                else
+                "riemannian_metric_flow_decoder_joint"
+                if DECODER_FLOW_JOINT
+                else
+                "riemannian_metric_flow_decoder_generated_adapt"
+                if DECODER_GENERATED_ADAPT_ONLY
+                else
                 "riemannian_metric_flow_decoder_body_adapt"
                 if DECODER_ADAPT and DECODER_ADAPT_BERT_LAST_N_LAYERS > 0
                 else "riemannian_metric_flow_decoder_adapt"

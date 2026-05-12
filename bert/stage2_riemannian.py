@@ -15,8 +15,18 @@ from stage2_config import (
     ODE_STEPS,
     PROMPT_LEN,
     SELF_GATE_SCALE,
+    START_MLP_HIDDEN_DIM,
+    START_NOISE_STD_FRAC,
+    START_TRANSFORMER_HEADS,
+    START_TRANSFORMER_HIDDEN_DIM,
+    START_TRANSFORMER_LAYERS,
+    STRUCTURED_START_ALPHA,
+    STRUCTURED_TARGET_START,
     TARGET_LATENT_MEAN,
     TARGET_LATENT_STD,
+    TOKEN_RESIDUAL_SCALE,
+    TOKEN_SHARED_BLOCK,
+    TOKEN_SHARED_BLOCK_SCALE,
 )
 
 
@@ -64,12 +74,28 @@ class FlowNet(nn.Module):
         ])
         self.self_gates = nn.ParameterList([nn.Parameter(torch.tensor(GATE_INIT)) for _ in range(depth)])
         self.cross_gates = nn.ParameterList([nn.Parameter(torch.tensor(GATE_INIT)) for _ in range(depth)])
+        self.token_block = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
         self.out_norm = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, latent_dim)
+        self.token_residual_proj = nn.Linear(hidden_dim, latent_dim)
+        nn.init.zeros_(self.token_block[-1].weight)
+        nn.init.zeros_(self.token_block[-1].bias)
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
+        nn.init.zeros_(self.token_residual_proj.weight)
+        nn.init.zeros_(self.token_residual_proj.bias)
+        self._last_token_block_norm = torch.tensor(0.0)
+        self._last_token_block_ratio = torch.tensor(0.0)
+        self._last_token_hidden_norm = torch.tensor(0.0)
+        self._last_velocity_out_norm = torch.tensor(0.0)
+        self._last_out_proj_weight_norm = torch.tensor(0.0)
 
-    def forward(self, z_t, t, z_cond, pos, mask=None):
+    def forward(self, z_t, t, z_cond, pos, mask=None, return_hidden=False):
         squeeze = z_t.dim() == 2
         if squeeze:
             z_t = z_t.unsqueeze(1)
@@ -134,10 +160,234 @@ class FlowNet(nn.Module):
             if mask is not None:
                 h = h * mask.to(h.dtype).unsqueeze(-1)
 
-        out = self.out_proj(self.out_norm(h))
+        h_before_token = h
+        if TOKEN_SHARED_BLOCK:
+            token_delta = TOKEN_SHARED_BLOCK_SCALE * self.token_block(h_before_token)
+            self._last_token_block_norm = token_delta.detach().norm(dim=-1).mean()
+            self._last_token_hidden_norm = h_before_token.detach().norm(dim=-1).mean()
+            self._last_token_block_ratio = self._last_token_block_norm / self._last_token_hidden_norm.clamp_min(1e-6)
+            h = h + token_delta
+            if mask is not None:
+                h = h * mask.to(h.dtype).unsqueeze(-1)
+        else:
+            self._last_token_block_norm = h_before_token.detach().new_tensor(0.0)
+            self._last_token_hidden_norm = h_before_token.detach().norm(dim=-1).mean()
+            self._last_token_block_ratio = h_before_token.detach().new_tensor(0.0)
+
+        hidden = self.out_norm(h)
+        out = self.out_proj(hidden)
+        if TOKEN_RESIDUAL_SCALE > 0:
+            out = out + TOKEN_RESIDUAL_SCALE * self.token_residual_proj(hidden)
+        self._last_velocity_out_norm = out.detach().norm(dim=-1).mean()
+        self._last_out_proj_weight_norm = self.out_proj.weight.detach().norm()
         if squeeze:
             out = out.squeeze(1)
+            hidden = hidden.squeeze(1)
+        if return_hidden:
+            return out, hidden
         return out
+
+
+class AuxTokenHead(nn.Module):
+    def __init__(self, hidden_dim=FLOW_HIDDEN_DIM, vocab_size=30522):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, vocab_size),
+        )
+
+    def forward(self, hidden):
+        return self.net(hidden)
+
+
+class StartMLP(nn.Module):
+    def __init__(self, latent_dim=256, hidden_dim=START_MLP_HIDDEN_DIM):
+        super().__init__()
+        self.pos_proj = nn.Sequential(
+            nn.Linear(1, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        self.net = nn.Sequential(
+            nn.LayerNorm(latent_dim * 2),
+            nn.Linear(latent_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, z_prompt, pos, mask=None):
+        prompt_summary = z_prompt.mean(dim=1)
+        prompt_summary = prompt_summary.unsqueeze(1).expand(-1, pos.size(1), -1)
+        pos_h = self.pos_proj(pos.unsqueeze(-1))
+        z_start = self.net(torch.cat([prompt_summary, pos_h], dim=-1))
+        if mask is not None:
+            z_start = z_start * mask.to(z_start.dtype).unsqueeze(-1)
+        return z_start
+
+
+class _StartTransformerLayer(nn.Module):
+    def __init__(self, latent_dim, num_heads, ffn_dim):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(latent_dim, num_heads, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(latent_dim, num_heads, batch_first=True)
+        self.ffn = nn.Sequential(
+            nn.Linear(latent_dim, ffn_dim),
+            nn.GELU(),
+            nn.Linear(ffn_dim, latent_dim),
+        )
+        self.norm1 = nn.LayerNorm(latent_dim)
+        self.norm2 = nn.LayerNorm(latent_dim)
+        self.norm3 = nn.LayerNorm(latent_dim)
+
+    def forward(self, x, z_prompt):
+        x2, _ = self.self_attn(x, x, x)
+        x = self.norm1(x + x2)
+        x2, _ = self.cross_attn(x, z_prompt, z_prompt)
+        x = self.norm2(x + x2)
+        x = self.norm3(x + self.ffn(x))
+        return x
+
+
+class StartTransformer(nn.Module):
+    def __init__(
+        self,
+        latent_dim=256,
+        num_layers=START_TRANSFORMER_LAYERS,
+        num_heads=START_TRANSFORMER_HEADS,
+        ffn_dim=START_TRANSFORMER_HIDDEN_DIM,
+    ):
+        super().__init__()
+        self.pos_proj = nn.Sequential(
+            nn.Linear(1, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        self.layers = nn.ModuleList([
+            _StartTransformerLayer(latent_dim, num_heads, ffn_dim)
+            for _ in range(num_layers)
+        ])
+        self.out_norm = nn.LayerNorm(latent_dim)
+        self.out_proj = nn.Linear(latent_dim, latent_dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, z_prompt, pos, mask=None):
+        x = self.pos_proj(pos.unsqueeze(-1))
+        for layer in self.layers:
+            x = layer(x, z_prompt)
+        x = self.out_proj(self.out_norm(x))
+        if mask is not None:
+            x = x * mask.to(x.dtype).unsqueeze(-1)
+        return x
+
+
+class DenoisingPrior(nn.Module):
+    """
+    x0-prediction denoising prior.
+    Input : z_t (noisy suffix latents), z_prompt, alpha (noise level), pos
+    Output: pred_z_real  (residual on z_t, zero-init)
+    """
+
+    def __init__(self, latent_dim=256, hidden_dim=512, num_layers=4, num_heads=8):
+        super().__init__()
+        self.alpha_embed = nn.Sequential(
+            nn.Linear(1, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        self.pos_proj = nn.Sequential(
+            nn.Linear(1, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        self.layers = nn.ModuleList([
+            _StartTransformerLayer(latent_dim, num_heads, hidden_dim)
+            for _ in range(num_layers)
+        ])
+        self.out_norm = nn.LayerNorm(latent_dim)
+        self.out_proj = nn.Linear(latent_dim, latent_dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, z_t, z_prompt, alpha, pos, mask=None):
+        # alpha: [B] — one scalar noise level per sample
+        alpha_emb = self.alpha_embed(alpha.unsqueeze(-1)).unsqueeze(1).expand(-1, z_t.size(1), -1)
+        pos_emb = self.pos_proj(pos.unsqueeze(-1))
+        x = z_t + alpha_emb + pos_emb
+        for layer in self.layers:
+            x = layer(x, z_prompt)
+        pred = z_t + self.out_proj(self.out_norm(x))  # residual: at init pred == z_t
+        if mask is not None:
+            pred = pred * mask.to(pred.dtype).unsqueeze(-1)
+        return pred
+
+
+class DenoisingPriorSampler(nn.Module):
+    """
+    Wraps DenoisingPrior to expose the start_mlp(z_prompt, pos, mask) interface.
+
+    Training mode  — call set_oracle_target(z_real) before forward():
+        z_t = alpha * z_real + beta * noise   (matches prior training distribution)
+    Inference mode — no set_oracle_target call:
+        z_t = beta * TARGET_LATENT_STD * randn  (pure Gaussian, no target signal)
+    """
+
+    def __init__(self, prior, latent_dim=256, alpha=0.5):
+        super().__init__()
+        self.prior = prior
+        self.alpha = alpha
+        self.latent_dim = latent_dim
+        self._oracle_target = None
+
+    def set_oracle_target(self, z_target):
+        """Set before forward() to use oracle z_t. Cleared after each forward call."""
+        self._oracle_target = z_target
+
+    def forward(self, z_prompt, pos, mask=None):
+        B, T = z_prompt.size(0), pos.size(1)
+        alpha_val = self.alpha
+        beta = (1.0 - alpha_val ** 2) ** 0.5
+
+        if self._oracle_target is not None:
+            z_t = alpha_val * self._oracle_target[:B].detach() + beta * torch.randn(
+                B, T, self.latent_dim, device=z_prompt.device, dtype=z_prompt.dtype
+            )
+            self._oracle_target = None  # clear after use
+        else:
+            z_t = (beta * TARGET_LATENT_STD) * torch.randn(
+                B, T, self.latent_dim, device=z_prompt.device, dtype=z_prompt.dtype
+            ) + TARGET_LATENT_MEAN
+
+        if mask is not None:
+            z_t = z_t * mask.to(z_t.dtype).unsqueeze(-1)
+        alpha_t = z_prompt.new_full((B,), alpha_val)
+        return self.prior(z_t, z_prompt, alpha_t, pos, mask)
+
+
+def flow_token_block_stats(flow_net):
+    model = getattr(flow_net, "_orig_mod", flow_net)
+
+    def scalar(name):
+        value = getattr(model, name, None)
+        if value is None:
+            return 0.0
+        if torch.is_tensor(value):
+            return value.detach().float().item()
+        return float(value)
+
+    return {
+        "token_block_norm": scalar("_last_token_block_norm"),
+        "token_block_ratio": scalar("_last_token_block_ratio"),
+        "token_hidden_norm": scalar("_last_token_hidden_norm"),
+        "velocity_out_norm": scalar("_last_velocity_out_norm"),
+        "out_proj_weight_norm": scalar("_last_out_proj_weight_norm"),
+    }
 
 
 class MetricNet(nn.Module):
@@ -203,10 +453,11 @@ class LatentProjector(nn.Module):
             h = h + block(h)
             if mask is not None:
                 h = h * mask.to(h.dtype).unsqueeze(-1)
-        delta = self.out_proj(self.out_norm(h))
+        raw_delta = self.out_proj(self.out_norm(h))
+        delta = self.residual_scale * torch.tanh(raw_delta)
         if mask is not None:
             delta = delta * mask.to(delta.dtype).unsqueeze(-1)
-        return z_gen + self.residual_scale * delta, delta
+        return z_gen + delta, delta
 
 
 def prompt_condition(z_data, attention_mask, prompt_len=PROMPT_LEN):
@@ -287,9 +538,38 @@ def natural_velocity(flow_net, metric_net, z, t, z_cond, pos):
     return v / g.clamp_min(1e-3), g
 
 
-def generate_suffix(flow_net, metric_net, z_cond, batch_size, suffix_len, latent_dim, device, steps=ODE_STEPS, mask=None):
+def structured_target_start(z_target, mask=None, alpha=STRUCTURED_START_ALPHA):
+    noise = torch.randn_like(z_target) * TARGET_LATENT_STD + TARGET_LATENT_MEAN
+    beta = max(0.0, 1.0 - alpha * alpha) ** 0.5
+    z = alpha * z_target + beta * noise
+    if mask is not None:
+        z = z * mask.to(z.dtype).unsqueeze(-1)
+    return z
+
+
+def generate_suffix(
+    flow_net,
+    metric_net,
+    z_cond,
+    batch_size,
+    suffix_len,
+    latent_dim,
+    device,
+    steps=ODE_STEPS,
+    mask=None,
+    start_mlp=None,
+    z_target_start=None,
+):
     pos = suffix_positions(batch_size, suffix_len, device)
-    z = torch.randn(batch_size, suffix_len, latent_dim, device=device) * BASE_NOISE_STD
+    if STRUCTURED_TARGET_START and z_target_start is not None:
+        z = structured_target_start(z_target_start, mask)
+    elif start_mlp is not None:
+        z = start_mlp(z_cond, pos, mask)
+        z = z + (START_NOISE_STD_FRAC * TARGET_LATENT_STD) * torch.randn_like(z)
+    else:
+        z = torch.randn(batch_size, suffix_len, latent_dim, device=device) * BASE_NOISE_STD
+    if mask is not None:
+        z = z * mask.to(z.dtype).unsqueeze(-1)
     z_initial = z.clone()
     dt = 1.0 / steps
     metric_snapshot = None

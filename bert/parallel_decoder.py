@@ -11,10 +11,15 @@ from datasets import load_dataset
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"using: {device}")
 
-MAX_LENGTH = 32
-TRAIN_SIZE = 500000
+MAX_LENGTH = 64
+TRAIN_SIZE = 1000000
 TRAIN_BATCH_SIZE = 128
-LATENT_NOISE_STD = 0.02
+EPOCHS = 3
+DENOISE_LATENTS = True
+LATENT_NOISE_STD_FRAC = 0.05
+LATENT_NOISE_WARMUP_FRAC = 0.10
+LATENT_NOISE_MIN_MULT = 0.25
+LATENT_STD_EMA_DECAY = 0.99
 
 
 def atomic_torch_save(obj, path):
@@ -76,7 +81,7 @@ class ParallelDecoder(nn.Module):
     def forward(self, z, residual_weight=1.0, latent_noise_std=0.0):
         # z: [B, seq_len, 768]
         h   = self.compress(z)                             # [B, seq_len, latent_dim]
-        if self.training and latent_noise_std > 0:
+        if latent_noise_std > 0:
             h = h + torch.randn_like(h) * latent_noise_std
         x   = self.project_up(h) + residual_weight * z    # annealed residual
         out = self.bert(inputs_embeds=x)
@@ -122,6 +127,7 @@ def train(encoder, decoder, train_loader, val_loader, device, epochs=10, lr=1e-4
     scaler        = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     VOCAB_SIZE    = 30522
     best_val_loss = float("inf")
+    latent_std_ema = None
 
     for epoch in range(epochs):
         # linear anneal: 1.0 → 0.0 over all epochs
@@ -135,12 +141,27 @@ def train(encoder, decoder, train_loader, val_loader, device, epochs=10, lr=1e-4
         # Instead of annealing over epochs, anneal within the single epoch by step.
         for step, batch in enumerate(train_loader):
             residual_weight = max(0.0, 1.0 - step / len(train_loader))  # 1.0 → 0.0 over steps
-            latent_noise_std = LATENT_NOISE_STD * (1.0 - residual_weight)
+            progress = (epoch * len(train_loader) + step + 1) / max(1, epochs * len(train_loader))
+            noise_warmup = min(1.0, progress / max(LATENT_NOISE_WARMUP_FRAC, 1e-6))
             input_ids      = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 z      = encoder(input_ids, attention_mask)
+                h_probe = decoder.compress(z)
+                valid_latents = h_probe[attention_mask.bool()]
+                batch_latent_std = valid_latents.detach().float().std().clamp_min(1e-6)
+                if latent_std_ema is None:
+                    latent_std_ema = batch_latent_std
+                else:
+                    latent_std_ema = (
+                        LATENT_STD_EMA_DECAY * latent_std_ema
+                        + (1.0 - LATENT_STD_EMA_DECAY) * batch_latent_std
+                    )
+                latent_noise_std = 0.0
+                if DENOISE_LATENTS:
+                    noise_mult = LATENT_NOISE_MIN_MULT + (1.0 - LATENT_NOISE_MIN_MULT) * noise_warmup
+                    latent_noise_std = (LATENT_NOISE_STD_FRAC * noise_mult * latent_std_ema).detach().item()
                 logits = decoder(
                     z,
                     residual_weight=residual_weight,
@@ -161,14 +182,23 @@ def train(encoder, decoder, train_loader, val_loader, device, epochs=10, lr=1e-4
 
             train_loss += loss.item()
             if step % 50 == 0:
-                print(f"epoch {epoch+1} step {step}/{len(train_loader)} | loss {loss.item():.4f} | residual_weight {residual_weight:.2f} | latent_noise {latent_noise_std:.3f}",
-                      flush=True)
+                print(
+                    f"epoch {epoch+1} step {step}/{len(train_loader)}"
+                    f" | loss {loss.item():.4f}"
+                    f" | residual_weight {residual_weight:.2f}"
+                    f" | latent_std {latent_std_ema.item():.4f}"
+                    f" | denoise_sigma {latent_noise_std:.5f}"
+                    f" ({LATENT_NOISE_STD_FRAC:.3f}x)",
+                    flush=True,
+                )
 
         avg_train = train_loss / len(train_loader)
 
         # ── val ───────────────────────────────────────────────────────────────
         decoder.eval()
         val_loss = 0
+        val_noisy_loss = 0
+        val_batches = 0
         with torch.no_grad():
             for batch in val_loader:
                 input_ids      = batch["input_ids"].to(device, non_blocking=True)
@@ -181,9 +211,28 @@ def train(encoder, decoder, train_loader, val_loader, device, epochs=10, lr=1e-4
                         input_ids.view(-1),
                         ignore_index=0,
                     ).item()
+                    noisy_sigma = (
+                        (LATENT_NOISE_STD_FRAC * latent_std_ema).detach().item()
+                        if DENOISE_LATENTS and latent_std_ema is not None
+                        else 0.0
+                    )
+                    noisy_logits = decoder(z, residual_weight=0.0, latent_noise_std=noisy_sigma)
+                    val_noisy_loss += F.cross_entropy(
+                        noisy_logits.view(-1, VOCAB_SIZE),
+                        input_ids.view(-1),
+                        ignore_index=0,
+                    ).item()
+                    val_batches += 1
 
         avg_val = val_loss / len(val_loader)
-        print(f"\nepoch {epoch+1} done | train {avg_train:.4f} | val {avg_val:.4f}\n", flush=True)
+        avg_noisy_val = val_noisy_loss / max(1, val_batches)
+        print(
+            f"\nepoch {epoch+1} done | train {avg_train:.4f}"
+            f" | val {avg_val:.4f}"
+            f" | val_noisy {avg_noisy_val:.4f}"
+            f" | latent_std {latent_std_ema.item():.4f}\n",
+            flush=True,
+        )
 
         if avg_val < best_val_loss:
             best_val_loss = avg_val
@@ -191,6 +240,14 @@ def train(encoder, decoder, train_loader, val_loader, device, epochs=10, lr=1e-4
                 "decoder": decoder.state_dict(),
                 "epoch":   epoch + 1,
                 "val_loss": best_val_loss,
+                "val_noisy_loss": avg_noisy_val,
+                "denoise_latents": DENOISE_LATENTS,
+                "latent_noise_std_frac": LATENT_NOISE_STD_FRAC,
+                "latent_noise_warmup_frac": LATENT_NOISE_WARMUP_FRAC,
+                "latent_noise_min_mult": LATENT_NOISE_MIN_MULT,
+                "latent_std_ema": latent_std_ema.detach().item(),
+                "max_length": MAX_LENGTH,
+                "train_size": TRAIN_SIZE,
             }, "stage1_best.pt")
             print(f"saved best model at val loss {best_val_loss:.4f}", flush=True)
 
@@ -274,7 +331,7 @@ if __name__ == "__main__":
         batch_size=TRAIN_BATCH_SIZE,
         max_length=MAX_LENGTH,
     )
-    train(encoder, decoder, train_loader, val_loader, device, epochs=1)
+    train(encoder, decoder, train_loader, val_loader, device, epochs=EPOCHS)
 
     best = torch.load("stage1_best.pt", map_location=device, weights_only=False)
     decoder.load_state_dict(best["decoder"])
