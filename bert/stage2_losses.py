@@ -236,6 +236,7 @@ def flow_matching_loss(
     teacher_decoder=None,
     start_mlp=None,
     latent_projector=None,
+    z_draft_start=None,
     global_step=None,
     steps_per_epoch=None,
     return_stats=False,
@@ -338,6 +339,8 @@ def flow_matching_loss(
             z_prompt = z_prompt[has_target]
         if suffix_ids is not None:
             suffix_ids = suffix_ids[has_target]
+        if z_draft_start is not None:
+            z_draft_start = z_draft_start[has_target]
 
     B, T, D = z_target.shape
     pos_seq = suffix_positions(B, T, z_target.device, z_target.dtype)
@@ -358,6 +361,8 @@ def flow_matching_loss(
         start_cosine_loss, start_cosine = rollout_cosine_alignment_loss(z_start, z_target, target_mask)
         z_noise = z_start
     elif start_mlp is not None:
+        if z_draft_start is not None and hasattr(start_mlp, "set_draft_target"):
+            start_mlp.set_draft_target(z_draft_start)
         if hasattr(start_mlp, "set_oracle_target"):
             start_mlp.set_oracle_target(z_target)
         z_start = start_mlp(z_cond, pos_seq, target_mask)
@@ -374,14 +379,15 @@ def flow_matching_loss(
         z_start = None
         z_noise = torch.randn_like(z_target) * BASE_NOISE_STD
     t_seq = torch.rand(B, T, device=z_target.device).pow(2)
-    z_t = (1 - t_seq.unsqueeze(-1)) * z_noise + t_seq.unsqueeze(-1) * z_target
-    v_true = z_target - z_noise
+    z_refine_target = z_noise + FLOW_REFINE_TARGET_FRACTION * (z_target - z_noise)
+    z_t = (1 - t_seq.unsqueeze(-1)) * z_noise + t_seq.unsqueeze(-1) * z_refine_target
+    v_true = z_refine_target - z_noise
     if aux_token_head is not None and suffix_ids is not None and AUX_TOKEN_CE_WEIGHT > 0:
         v_pred, aux_hidden = flow_net(z_t, t_seq, z_cond, pos_seq, target_mask, return_hidden=True)
     else:
         v_pred = flow_net(z_t, t_seq, z_cond, pos_seq, target_mask)
         aux_hidden = None
-    z_x0 = z_t + (1.0 - t_seq.unsqueeze(-1)) * v_pred
+    z_x0 = z_t + FLOW_REFINE_SCALE * (1.0 - t_seq.unsqueeze(-1)) * v_pred
 
     z_flat, z_t_flat, v_true_flat, v_pred_flat, z_x0_flat, cond_flat, pos_flat, t_flat = flatten_valid(
         z_target,
@@ -519,6 +525,8 @@ def flow_matching_loss(
             z_roll_start = structured_target_start(z_roll_target.detach(), roll_mask)
             z_roll = z_roll_start
         elif start_mlp is not None:
+            if z_draft_start is not None and hasattr(start_mlp, "set_draft_target"):
+                start_mlp.set_draft_target(z_draft_start[:n_rollout])
             if hasattr(start_mlp, "set_oracle_target"):
                 start_mlp.set_oracle_target(z_roll_target)
             z_roll_start = start_mlp(z_roll_cond, pos_roll, roll_mask)
@@ -532,7 +540,7 @@ def flow_matching_loss(
         for i in range(ROLLOUT_TRAIN_STEPS):
             t_roll = torch.full((n_rollout, T), i / ROLLOUT_TRAIN_STEPS, device=z_target.device)
             v_roll, _ = natural_velocity(flow_net, metric_net, z_roll, t_roll, z_roll_cond, pos_roll)
-            z_roll = z_roll + v_roll * dt
+            z_roll = z_roll + FLOW_REFINE_SCALE * v_roll * dt
             if roll_mask is not None:
                 z_roll = z_roll * roll_mask.to(z_roll.dtype).unsqueeze(-1)
 

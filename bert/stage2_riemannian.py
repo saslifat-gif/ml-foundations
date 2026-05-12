@@ -7,6 +7,7 @@ from stage2_config import (
     CROSS_GATE_SCALE,
     FLOW_DEPTH,
     FLOW_HIDDEN_DIM,
+    FLOW_REFINE_SCALE,
     GATE_INIT,
     GATE_REG_WEIGHT,
     MAX_SEQ_LEN,
@@ -27,7 +28,14 @@ from stage2_config import (
     TOKEN_RESIDUAL_SCALE,
     TOKEN_SHARED_BLOCK,
     TOKEN_SHARED_BLOCK_SCALE,
+    VELOCITY_CLAMP,
 )
+
+
+def clamp_velocity(v):
+    if VELOCITY_CLAMP is None or VELOCITY_CLAMP <= 0:
+        return v
+    return VELOCITY_CLAMP * torch.tanh(v / VELOCITY_CLAMP)
 
 
 class FlowNet(nn.Module):
@@ -178,6 +186,7 @@ class FlowNet(nn.Module):
         out = self.out_proj(hidden)
         if TOKEN_RESIDUAL_SCALE > 0:
             out = out + TOKEN_RESIDUAL_SCALE * self.token_residual_proj(hidden)
+        out = clamp_velocity(out)
         self._last_velocity_out_norm = out.detach().norm(dim=-1).mean()
         self._last_out_proj_weight_norm = self.out_proj.weight.detach().norm()
         if squeeze:
@@ -332,38 +341,91 @@ class DenoisingPriorSampler(nn.Module):
     """
     Wraps DenoisingPrior to expose the start_mlp(z_prompt, pos, mask) interface.
 
-    Training mode  — call set_oracle_target(z_real) before forward():
-        z_t = alpha * z_real + beta * noise   (matches prior training distribution)
-    Inference mode — no set_oracle_target call:
-        z_t = beta * TARGET_LATENT_STD * randn  (pure Gaussian, no target signal)
+    use_oracle=True  (stage2 training with oracle z_t):
+        set_oracle_target(z_real) before forward() →
+        z_t = alpha * z_real + beta * noise  (matches prior oracle training distribution)
+    use_oracle=False (inference-matched training / actual inference):
+        set_oracle_target() is a no-op; forward() runs the chain:
+        z = noise → prior(chain_alphas[0]) → … → prior(chain_alphas[-1])
     """
 
-    def __init__(self, prior, latent_dim=256, alpha=0.5):
+    def __init__(self, prior, latent_dim=256, alpha=0.5,
+                 chain_alphas=None, use_oracle=True):
         super().__init__()
         self.prior = prior
         self.alpha = alpha
         self.latent_dim = latent_dim
+        self.chain_alphas = chain_alphas if chain_alphas is not None else [0.3, 0.5, 0.7]
+        self.use_oracle = use_oracle
         self._oracle_target = None
 
     def set_oracle_target(self, z_target):
-        """Set before forward() to use oracle z_t. Cleared after each forward call."""
-        self._oracle_target = z_target
+        """Set before forward() to use oracle z_t.
+        No-op when use_oracle=False — sampler always runs chain mode."""
+        if self.use_oracle:
+            self._oracle_target = z_target
 
     def forward(self, z_prompt, pos, mask=None):
         B, T = z_prompt.size(0), pos.size(1)
-        alpha_val = self.alpha
-        beta = (1.0 - alpha_val ** 2) ** 0.5
 
         if self._oracle_target is not None:
+            # Oracle mode: single denoising step from alpha-noised real latent
+            alpha_val = self.alpha
+            beta = (1.0 - alpha_val ** 2) ** 0.5
             z_t = alpha_val * self._oracle_target[:B].detach() + beta * torch.randn(
                 B, T, self.latent_dim, device=z_prompt.device, dtype=z_prompt.dtype
             )
-            self._oracle_target = None  # clear after use
+            self._oracle_target = None
+            if mask is not None:
+                z_t = z_t * mask.to(z_t.dtype).unsqueeze(-1)
+            alpha_t = z_prompt.new_full((B,), alpha_val)
+            return self.prior(z_t, z_prompt, alpha_t, pos, mask)
         else:
-            z_t = (beta * TARGET_LATENT_STD) * torch.randn(
+            # Chain mode: pure noise → prior(chain_alphas[0]) → … → prior(chain_alphas[-1])
+            z = TARGET_LATENT_STD * torch.randn(
                 B, T, self.latent_dim, device=z_prompt.device, dtype=z_prompt.dtype
             ) + TARGET_LATENT_MEAN
+            if mask is not None:
+                z = z * mask.to(z.dtype).unsqueeze(-1)
+            for alpha_val in self.chain_alphas:
+                alpha_t = z_prompt.new_full((B,), alpha_val)
+                z = self.prior(z, z_prompt, alpha_t, pos, mask)
+            return z
 
+
+class DraftPriorSampler(DenoisingPriorSampler):
+    """
+    Draft-conditioned prior sampler.
+
+    Training/inference path:
+        set_draft_target(z_draft) before forward() →
+        z_t = alpha * z_draft + beta * noise → prior(z_t, z_prompt, alpha, pos)
+
+    It keeps DenoisingPriorSampler's fallback behavior so old call sites remain safe,
+    but stage2 should provide draft targets when DRAFT_PRIOR is enabled.
+    """
+
+    def __init__(self, prior, latent_dim=256, alpha=0.7):
+        super().__init__(prior, latent_dim=latent_dim, alpha=alpha, use_oracle=False)
+        self._draft_target = None
+
+    def set_draft_target(self, z_draft):
+        self._draft_target = z_draft
+
+    def forward(self, z_prompt, pos, mask=None):
+        if self._draft_target is None:
+            return super().forward(z_prompt, pos, mask)
+
+        B, T = z_prompt.size(0), pos.size(1)
+        z_draft = self._draft_target[:B].detach()
+        self._draft_target = None
+        alpha_val = self.alpha
+        beta = (1.0 - alpha_val ** 2) ** 0.5
+        z_t = alpha_val * z_draft + beta * (
+            torch.randn(B, T, self.latent_dim, device=z_prompt.device, dtype=z_prompt.dtype)
+            * TARGET_LATENT_STD
+            + TARGET_LATENT_MEAN
+        )
         if mask is not None:
             z_t = z_t * mask.to(z_t.dtype).unsqueeze(-1)
         alpha_t = z_prompt.new_full((B,), alpha_val)
@@ -535,7 +597,7 @@ def natural_velocity(flow_net, metric_net, z, t, z_cond, pos):
         pooled_cond.reshape(-1, z.size(-1)),
         pos.reshape(-1),
     ).reshape_as(z)
-    return v / g.clamp_min(1e-3), g
+    return clamp_velocity(v / g.clamp_min(1e-3)), g
 
 
 def structured_target_start(z_target, mask=None, alpha=STRUCTURED_START_ALPHA):
@@ -577,7 +639,7 @@ def generate_suffix(
         t = torch.full((batch_size, suffix_len), i / steps, device=device)
         with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
             v, metric_snapshot = natural_velocity(flow_net, metric_net, z, t, z_cond, pos)
-        z = z + v * dt
+        z = z + FLOW_REFINE_SCALE * v * dt
         if mask is not None:
             z = z * mask.to(z.dtype).unsqueeze(-1)
     z_uncalibrated = z.clone()

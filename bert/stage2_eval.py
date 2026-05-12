@@ -236,6 +236,7 @@ def evaluate(
     start_mlp=None,
     aux_token_head=None,
     latent_projector=None,
+    draft_start_fn=None,
 ):
     flow_net.eval()
     metric_net.eval()
@@ -260,6 +261,7 @@ def evaluate(
                 z_cond = prompt_condition(z_data, attention_mask)
                 z_target = z_data[:, PROMPT_LEN:, :]
                 target_mask = attention_mask[:, PROMPT_LEN:]
+                z_draft_start = draft_start_fn(input_ids, attention_mask) if draft_start_fn is not None else None
                 val_loss += flow_matching_loss(
                     flow_net,
                     metric_net,
@@ -267,6 +269,7 @@ def evaluate(
                     z_cond,
                     target_mask,
                     start_mlp=start_mlp,
+                    z_draft_start=z_draft_start,
                 ).item()
     avg_val_loss = val_loss / len(val_loader)
 
@@ -279,8 +282,11 @@ def evaluate(
         B, S, D = z_real.shape
         suffix_mask = attn_mask[:, PROMPT_LEN:].bool()
         z_real_suffix = z_real[:, PROMPT_LEN:, :]
+        z_draft_start = draft_start_fn(input_ids, attn_mask) if draft_start_fn is not None else None
         z_real_flat = z_real_suffix[suffix_mask]
         z_cond = prompt_condition(z_real, attn_mask)
+        if z_draft_start is not None and start_mlp is not None and hasattr(start_mlp, "set_draft_target"):
+            start_mlp.set_draft_target(z_draft_start)
         z_gen_suffix, metric_snapshot, z_initial_suffix, z_uncalibrated_suffix = generate_suffix(
             flow_net,
             metric_net,
@@ -339,6 +345,8 @@ def evaluate(
         projected_norm = z_projected_flat.norm(dim=-1).mean().item()
         if start_mlp is not None:
             pos_start = suffix_positions(B, S - PROMPT_LEN, device, z_real.dtype)
+            if z_draft_start is not None and hasattr(start_mlp, "set_draft_target"):
+                start_mlp.set_draft_target(z_draft_start)
             z_coarse_suffix = start_mlp(z_cond, pos_start, suffix_mask)
             coarse_mean, coarse_std, coarse_cosine, coarse_decode_ce = generated_decode_stats(
                 z_real,
@@ -422,9 +430,23 @@ def evaluate(
                 decode_targets,
                 ignore_index=0,
             ).item()
+            fused_suffix_logits = fused_decode_logits[:, PROMPT_LEN:, :].float()
+            fused_targets = input_ids[decode_idx, PROMPT_LEN:]
+            fused_valid = fused_targets != 0
+            if fused_valid.any():
+                fused_probs = fused_suffix_logits.softmax(dim=-1)
+                fused_target_ids = fused_targets.clamp(0, fused_probs.size(-1) - 1).unsqueeze(-1)
+                fused_decode_target_prob = (
+                    fused_probs.gather(dim=-1, index=fused_target_ids).squeeze(-1)[fused_valid]
+                    .mean()
+                    .item()
+                )
+            else:
+                fused_decode_target_prob = 0.0
         else:
             real_decode_ce = 0.0
             fused_decode_ce = gen_decode_ce
+            fused_decode_target_prob = 0.0
         decode_ce_gap = gen_decode_ce - real_decode_ce
         fused_decode_ce_gap = fused_decode_ce - real_decode_ce
 
@@ -573,7 +595,10 @@ def evaluate(
     print(f"  cosine sim   : {cosine_sim:.4f}")
     print(f"  decoder CE   : real={real_decode_ce:.4f}  init={initial_decode_ce:.4f}  raw={uncal_decode_ce:.4f}  gen={gen_decode_ce:.4f}  gap={decode_ce_gap:.4f}")
     if aux_token_head is not None:
-        print(f"  fused CE     : beta={AUX_LOGIT_FUSION_BETA:.3f}  gen={fused_decode_ce:.4f}  gap={fused_decode_ce_gap:.4f}")
+        print(
+            f"  fused CE     : beta={AUX_LOGIT_FUSION_BETA:.3f}  gen={fused_decode_ce:.4f}  "
+            f"gap={fused_decode_ce_gap:.4f}  p={fused_decode_target_prob:.4f}"
+        )
     if mix_decode_ce:
         mix_text = "  ".join(f"a={alpha:.2f}:{ce:.3f}" for alpha, ce in mix_decode_ce)
         print(f"  mix CE raw   : {mix_text}")

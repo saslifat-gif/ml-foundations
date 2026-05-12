@@ -17,6 +17,7 @@ from stage2_riemannian import (
     AuxTokenHead,
     DenoisingPrior,
     DenoisingPriorSampler,
+    DraftPriorSampler,
     FlowNet,
     LatentProjector,
     MetricNet,
@@ -97,6 +98,15 @@ def freeze_module(module):
     module.eval()
 
 
+def set_module_trainable(module, trainable):
+    for param in module.parameters():
+        param.requires_grad = trainable
+    if trainable:
+        module.train()
+    else:
+        module.eval()
+
+
 seed_everything(SEED)
 print(f"seed: {SEED}", flush=True)
 
@@ -111,12 +121,15 @@ if FAST_DEBUG:
 print(
     "stage2 config | "
     f"train_size={TRAIN_SIZE} batch={TRAIN_BATCH_SIZE} "
-    f"flow={FLOW_HIDDEN_DIM}x{FLOW_DEPTH} metric={METRIC_HIDDEN_DIM} "
+    f"flow={FLOW_HIDDEN_DIM}x{FLOW_DEPTH} refine_scale={FLOW_REFINE_SCALE} "
+    f"target_frac={FLOW_REFINE_TARGET_FRACTION} vclamp={VELOCITY_CLAMP} "
+    f"metric={METRIC_HIDDEN_DIM} metric_frozen_steps={METRIC_FROZEN_STEPS} "
     f"flow_token_ce={ROLLOUT_FLOW_TOKEN_CE_WEIGHT}x{ROLLOUT_FLOW_TOKEN_CE_BATCH} "
     f"fused_ce={FUSED_TOKEN_CE_WEIGHT}x{FUSED_TOKEN_CE_BATCH} beta={AUX_LOGIT_FUSION_BETA} "
     f"structured_start={STRUCTURED_TARGET_START} alpha={STRUCTURED_START_ALPHA} "
     f"start_mlp={START_MLP} start_transformer={START_TRANSFORMER} "
     f"denoising_prior={DENOISING_PRIOR} dp_alpha={DENOISING_PRIOR_ALPHA} dp_frozen={DENOISING_PRIOR_FROZEN} "
+    f"draft_prior={DRAFT_PRIOR} draft_drop={DRAFT_PRIOR_DROP_PROB} "
     f"start_noise={START_NOISE_STD_FRAC} "
     f"aux_token={AUX_TOKEN_CE_WEIGHT} shared_block={TOKEN_SHARED_BLOCK}x{TOKEN_SHARED_BLOCK_SCALE} "
     f"token_residual={TOKEN_RESIDUAL_SCALE} "
@@ -169,10 +182,19 @@ if DENOISING_PRIOR:
     _dp.load_state_dict(_dp_ckpt["denoising_prior"])
     if DENOISING_PRIOR_FROZEN:
         freeze_module(_dp)
-    start_mlp = DenoisingPriorSampler(_dp, latent_dim=256, alpha=DENOISING_PRIOR_ALPHA).to(device)
+    if DRAFT_PRIOR:
+        start_mlp = DraftPriorSampler(
+            _dp, latent_dim=256, alpha=DENOISING_PRIOR_ALPHA,
+        ).to(device)
+    else:
+        start_mlp = DenoisingPriorSampler(
+            _dp, latent_dim=256, alpha=DENOISING_PRIOR_ALPHA,
+            use_oracle=DENOISING_PRIOR_ORACLE_ZT,
+        ).to(device)
     print(
-        f"denoising prior loaded from {DENOISING_PRIOR_PATH} | "
-        f"alpha={DENOISING_PRIOR_ALPHA} frozen={DENOISING_PRIOR_FROZEN}",
+        f"{'draft' if DRAFT_PRIOR else 'denoising'} prior loaded from {DENOISING_PRIOR_PATH} | "
+        f"alpha={DENOISING_PRIOR_ALPHA} frozen={DENOISING_PRIOR_FROZEN} "
+        f"oracle_zt={DENOISING_PRIOR_ORACLE_ZT} draft_prior={DRAFT_PRIOR}",
         flush=True,
     )
 elif START_TRANSFORMER:
@@ -258,6 +280,51 @@ print(
     f"optimizer_trainable={optimizer_param_count}",
     flush=True,
 )
+
+
+PUNCT_TOKENS = {".", ",", ";", ":", "!", "?", "-", "(", ")", "'", '"'}
+SPECIAL_IDS = set(tokenizer.all_special_ids)
+PAD_ID = tokenizer.pad_token_id
+
+
+def _is_draft_anchor(token):
+    clean = token[2:] if token.startswith("##") else token
+    return clean in PUNCT_TOKENS or any(ch.isdigit() for ch in clean) or (len(clean) >= 6 and clean.isalpha())
+
+
+def make_stage2_draft_ids(input_ids, attention_mask):
+    """Stage2 draft source: 95% real target, order preserved, no replacement by default."""
+    if not DRAFT_PRIOR:
+        return None, None
+    draft = input_ids.clone()
+    suffix_len = input_ids.size(1) - PROMPT_LEN
+    for b in range(input_ids.size(0)):
+        kept = []
+        for tok_id, tok_mask in zip(input_ids[b, PROMPT_LEN:].tolist(), attention_mask[b, PROMPT_LEN:].tolist()):
+            if tok_mask == 0 or tok_id in SPECIAL_IDS:
+                continue
+            token = tokenizer.convert_ids_to_tokens(int(tok_id))
+            if (not _is_draft_anchor(token)) and random.random() < DRAFT_PRIOR_DROP_PROB:
+                continue
+            kept.append(int(tok_id))
+        kept = kept[:suffix_len]
+        draft[b, PROMPT_LEN:] = torch.tensor(
+            kept + [PAD_ID] * (suffix_len - len(kept)),
+            device=input_ids.device,
+            dtype=input_ids.dtype,
+        )
+    draft_mask = (draft != PAD_ID).to(attention_mask.dtype)
+    draft_mask[:, :PROMPT_LEN] = attention_mask[:, :PROMPT_LEN]
+    return draft, draft_mask
+
+
+def make_stage2_draft_latents(input_ids, attention_mask):
+    if not DRAFT_PRIOR:
+        return None
+    draft_ids, draft_mask = make_stage2_draft_ids(input_ids, attention_mask)
+    with torch.no_grad():
+        z_draft = decoder.compress(encoder(draft_ids, draft_mask))
+    return z_draft[:, PROMPT_LEN:, :]
 scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 best_score = float("inf")
 checkpoint_path = (
@@ -381,7 +448,6 @@ for epoch in range(EPOCHS):
             latent_projector.train()
     else:
         flow_net.train()
-        metric_net.train()
         if aux_token_head is not None:
             aux_token_head.train()
         if start_mlp is not None:
@@ -405,6 +471,14 @@ for epoch in range(EPOCHS):
     train_loss = 0
 
     for step, batch in enumerate(train_loader):
+        global_step = epoch * len(train_loader) + step
+        metric_trainable = not (
+            METRIC_FROZEN_STEPS > 0
+            and global_step < METRIC_FROZEN_STEPS
+            and not (LATENT_PROJECTOR and LATENT_PROJECTOR_ONLY)
+            and not DECODER_GENERATED_ADAPT_ONLY
+        )
+        set_module_trainable(metric_net, metric_trainable)
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
 
@@ -416,6 +490,7 @@ for epoch in range(EPOCHS):
             drop_mask = torch.rand(z_data.size(0), device=device) < COND_DROP_PROB
             z_cond = z_cond.masked_fill(drop_mask[:, None, None], 0.0)
             z_target = z_data[:, PROMPT_LEN:, :]
+            z_draft_start = make_stage2_draft_latents(input_ids, attention_mask)
             target_mask = attention_mask[:, PROMPT_LEN:]
             loss, stats = flow_matching_loss(
                 flow_net,
@@ -430,8 +505,9 @@ for epoch in range(EPOCHS):
                 teacher_decoder=teacher_decoder,
                 start_mlp=start_mlp,
                 latent_projector=latent_projector,
+                z_draft_start=z_draft_start,
                 return_stats=True,
-                global_step=epoch * len(train_loader) + step,
+                global_step=global_step,
                 steps_per_epoch=len(train_loader),
             )
 
@@ -548,6 +624,7 @@ for epoch in range(EPOCHS):
         start_mlp=start_mlp,
         aux_token_head=aux_token_head,
         latent_projector=latent_projector,
+        draft_start_fn=make_stage2_draft_latents if DRAFT_PRIOR else None,
     )
 
     if val_score < best_score:
@@ -566,6 +643,10 @@ for epoch in range(EPOCHS):
             "euclidean_loss_weight": EUCLIDEAN_LOSS_WEIGHT,
             "x0_loss_weight": X0_LOSS_WEIGHT,
             "decode_loss_weight": DECODE_LOSS_WEIGHT,
+            "flow_refine_scale": FLOW_REFINE_SCALE,
+            "flow_refine_target_fraction": FLOW_REFINE_TARGET_FRACTION,
+            "velocity_clamp": VELOCITY_CLAMP,
+            "metric_frozen_steps": METRIC_FROZEN_STEPS,
             "decode_loss_batch": DECODE_LOSS_BATCH,
             "rollout_loss_weight": ROLLOUT_LOSS_WEIGHT,
             "rollout_entropy_loss_weight": ROLLOUT_ENTROPY_LOSS_WEIGHT,
@@ -604,6 +685,10 @@ for epoch in range(EPOCHS):
             "denoising_prior_path": DENOISING_PRIOR_PATH,
             "denoising_prior_alpha": DENOISING_PRIOR_ALPHA,
             "denoising_prior_frozen": DENOISING_PRIOR_FROZEN,
+            "draft_prior": DRAFT_PRIOR,
+            "draft_prior_path": DENOISING_PRIOR_PATH if DRAFT_PRIOR else None,
+            "draft_prior_drop_prob": DRAFT_PRIOR_DROP_PROB,
+            "draft_prior_replace_prob": DRAFT_PRIOR_REPLACE_PROB,
             "start_transformer_layers": START_TRANSFORMER_LAYERS,
             "start_transformer_heads": START_TRANSFORMER_HEADS,
             "start_transformer_hidden_dim": START_TRANSFORMER_HIDDEN_DIM,
